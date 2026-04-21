@@ -2,6 +2,9 @@
 
 A plugin for [Slopsmith](https://github.com/byrongamatos/slopsmith) that installs, updates, and uninstalls other plugins **and the slopsmith core itself** from a single in-app screen. Uses GitHub downloads directly — no `git` CLI inside the container, no terminal, no `docker compose` commands required.
 
+<img width="997" height="999" alt="image" src="https://github.com/user-attachments/assets/57f68aca-7362-4f94-ab9e-73e269a6ad1e" />
+<img width="994" height="1239" alt="updateman2" src="https://github.com/user-attachments/assets/4c1457c0-5bd2-48c7-982f-7cff33406119" />
+
 ## Features
 
 - **Browse the registry** — parses the "Available Plugins" table from slopsmith's README and lists every plugin with a one-click Install button
