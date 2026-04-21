@@ -1,0 +1,10 @@
+{
+  "id": "update_manager",
+  "name": "Update Manager",
+  "version": "1.4.0",
+  "private": false,
+  "nav": { "label": "Update Manager", "screen": "plugin-update_manager" },
+  "screen": "screen.html",
+  "script": "screen.js",
+  "routes": "routes.py"
+}

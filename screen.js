@@ -1,0 +1,666 @@
+/* Update Manager - install + update plugins and slopsmith core over GitHub */
+(function () {
+    const RESTART_KEY = 'update_manager:restartPending';
+    const API = '/api/plugins/update_manager';
+    const CORE_KEY = '__core__';
+
+    let plugins = [];        // /api/plugins result (installed list)
+    let updates = {};        // API + '/updates' -> { [id]: {local, remote, branch, source, repo} }
+    let updateErrors = {};
+    let sources = {};        // { [id]: {repo, url, branch, source} } — GitHub origin for every resolvable plugin
+    let excluded = new Set(); // plugin ids the user has opted out of updates for
+    let registry = [];       // API + '/registry' -> entries
+    let coreStatus = null;   // API + '/core'
+    let currentTab = 'updates';
+
+    // ── Screen show hook ───────────────────────────────────────────────
+    const _origShowScreen = window.showScreen;
+    window.showScreen = function (id) {
+        _origShowScreen(id);
+        if (id === 'plugin-update_manager') updaterOnShow();
+    };
+
+    function updaterOnShow() {
+        if (localStorage.getItem(RESTART_KEY) === '1') {
+            document.getElementById('updater-restart-banner').classList.remove('hidden');
+        }
+        if (currentTab === 'updates') updaterCheck();
+        else updaterLoadRegistry();
+    }
+
+    // ── Tabs ───────────────────────────────────────────────────────────
+    window.updaterTab = function (tab) {
+        currentTab = tab;
+        const tUp = document.getElementById('updater-tab-updates');
+        const tBr = document.getElementById('updater-tab-browse');
+        const pUp = document.getElementById('updater-pane-updates');
+        const pBr = document.getElementById('updater-pane-browse');
+        const activeCls = 'px-4 py-2 text-sm transition border-b-2 border-accent text-white';
+        const idleCls = 'px-4 py-2 text-sm transition border-b-2 border-transparent text-gray-500 hover:text-white';
+        if (tab === 'updates') {
+            tUp.className = activeCls;
+            tBr.className = idleCls;
+            pUp.classList.remove('hidden');
+            pBr.classList.add('hidden');
+            if (!plugins.length) updaterCheck();
+        } else {
+            tUp.className = idleCls;
+            tBr.className = activeCls;
+            pUp.classList.add('hidden');
+            pBr.classList.remove('hidden');
+            if (!registry.length) updaterLoadRegistry();
+        }
+    };
+
+    // ── Check for updates ──────────────────────────────────────────────
+    window.updaterCheck = async function () {
+        const btn = document.getElementById('updater-check-btn');
+        const loading = document.getElementById('updater-loading');
+        const status = document.getElementById('updater-status');
+        const table = document.getElementById('updater-table');
+        btn.disabled = true;
+        btn.textContent = 'Checking...';
+        loading.classList.remove('hidden');
+        status.textContent = '';
+        table.innerHTML = '';
+        try {
+            const [pRes, uRes, cRes] = await Promise.all([
+                fetch('/api/plugins'),
+                fetch(API + '/updates'),
+                fetch(API + '/core'),
+            ]);
+            plugins = await pRes.json();
+            const uData = await uRes.json();
+            updates = uData.updates || {};
+            updateErrors = uData.errors || {};
+            sources = uData.sources || {};
+            excluded = new Set(uData.excluded || []);
+            coreStatus = await cRes.json();
+            updaterRenderCore();
+            updaterRenderUpdates();
+            document.getElementById('updater-last-checked').textContent =
+                'Last checked: ' + new Date().toLocaleTimeString();
+            const pluginCount = Object.keys(updates).length;
+            const coreBehind = !!(coreStatus && coreStatus.behind && !coreStatus.excluded);
+            const total = pluginCount + (coreBehind ? 1 : 0);
+            status.textContent = total === 0
+                ? 'Everything up to date.'
+                : total + ' update' + (total > 1 ? 's' : '') + ' available';
+            const coreUpdatable = coreBehind && !coreStatus.rebuild_required;
+            document.getElementById('updater-update-all-btn')
+                .classList.toggle('hidden', pluginCount === 0 && !coreUpdatable);
+        } catch (e) {
+            status.textContent = 'Check failed: ' + e.message;
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Check for updates';
+            loading.classList.add('hidden');
+        }
+    };
+
+    // ── Core card ──────────────────────────────────────────────────────
+    function updaterRenderCore() {
+        const card = document.getElementById('updater-core-card');
+        const rebuildBanner = document.getElementById('updater-rebuild-banner');
+        const rebuildCmdEl = document.getElementById('updater-rebuild-cmd');
+        const rebuildFilesEl = document.getElementById('updater-rebuild-files');
+        if (!card) return;
+        if (!coreStatus) { card.classList.add('hidden'); rebuildBanner.classList.add('hidden'); return; }
+
+        const c = coreStatus;
+        card.classList.remove('hidden');
+
+        let statusHtml, actionHtml, localStr = '', remoteStr = '', rowBg;
+
+        if (c.error) {
+            rowBg = 'bg-dark-800/30';
+            statusHtml = `<span class="text-red-400 text-xs" title="${esc(c.error)}">Check failed</span>`;
+            actionHtml = `<button onclick="updaterCheck()" class="text-gray-400 hover:text-white text-xs transition">Retry</button>`;
+        } else if (!c.tracking) {
+            rowBg = 'bg-dark-800/30';
+            statusHtml = `<span class="text-gray-400 font-semibold text-xs">Tracking not initialized</span>
+                <div class="text-[10px] text-gray-600 mt-0.5">Stamp the current commit to enable update checks</div>`;
+            actionHtml = `<button onclick="updaterInitCore(this)"
+                class="bg-accent/20 hover:bg-accent/30 text-accent px-3 py-1 rounded-lg text-xs transition">Initialize tracking</button>`;
+            remoteStr = (c.remote_sha || '').slice(0, 7);
+        } else if (c.excluded) {
+            rowBg = 'bg-dark-900/40 opacity-60';
+            localStr = (c.local_sha || '').slice(0, 7);
+            remoteStr = (c.remote_sha || '').slice(0, 7);
+            statusHtml = `<span class="text-gray-500 font-semibold text-xs">Excluded</span>
+                <div class="text-[10px] text-gray-600 mt-0.5">Updates disabled</div>`;
+            actionHtml = `<span class="text-gray-700 text-xs">—</span>`;
+        } else if (c.behind && c.rebuild_required) {
+            rowBg = 'bg-dark-700/40';
+            localStr = (c.local_sha || '').slice(0, 7);
+            remoteStr = (c.remote_sha || '').slice(0, 7);
+            statusHtml = `<span class="text-amber-400 font-semibold text-xs">Rebuild required</span>
+                <div class="text-[10px] text-gray-600 mt-0.5">${(c.blockers || []).length} unmounted file(s) changed</div>`;
+            actionHtml = `<button disabled title="Requires host-side rebuild"
+                class="bg-dark-700 text-gray-500 px-3 py-1 rounded-lg text-xs cursor-not-allowed">Blocked</button>`;
+        } else if (c.behind) {
+            rowBg = 'bg-dark-700/40';
+            localStr = (c.local_sha || '').slice(0, 7);
+            remoteStr = (c.remote_sha || '').slice(0, 7);
+            statusHtml = `<span class="text-amber-400 font-semibold text-xs">Update available</span>
+                <div class="text-[10px] text-gray-600 mt-0.5">${esc(c.repo)} · ${esc(c.branch)}</div>`;
+            actionHtml = `<button onclick="updaterUpdateCore(this)"
+                class="bg-accent/20 hover:bg-accent/30 text-accent px-3 py-1 rounded-lg text-xs transition">Update</button>`;
+        } else {
+            rowBg = 'bg-dark-800/30';
+            localStr = (c.local_sha || '').slice(0, 7);
+            remoteStr = (c.remote_sha || '').slice(0, 7);
+            statusHtml = `<span class="text-green-400 font-semibold text-xs">Up to date</span>`;
+            actionHtml = `<span class="text-gray-600 text-xs">—</span>`;
+        }
+
+        const exclCheckbox = c.tracking
+            ? `<label class="inline-flex items-center justify-center cursor-pointer" title="Exclude slopsmith core from update checks">
+                <input type="checkbox" data-plugin-id="${CORE_KEY}" onchange="updaterToggleExclude(this)"
+                    ${c.excluded ? 'checked' : ''}
+                    class="accent-amber-500 w-3.5 h-3.5 rounded">
+            </label>`
+            : '<span class="text-gray-700 text-xs">—</span>';
+
+        card.innerHTML = `
+            <div class="grid grid-cols-[1fr_auto_auto_auto_auto_auto] gap-x-4 text-xs text-gray-500 font-semibold uppercase tracking-wider px-3 py-2 border-b border-gray-800">
+                <span>Slopsmith Core</span>
+                <span class="w-24 text-center hidden sm:block">Local</span>
+                <span class="w-24 text-center hidden sm:block">Remote</span>
+                <span class="w-28 text-center">Status</span>
+                <span class="w-20 text-center" title="Exclude from automatic updates">Exclude</span>
+                <span class="w-40 text-center">Action</span>
+            </div>
+            <div class="grid grid-cols-[1fr_auto_auto_auto_auto_auto] gap-x-4 items-center px-3 py-2.5 rounded-lg ${rowBg} transition">
+                <div class="min-w-0">
+                    <a href="${esc(c.url)}" target="_blank" rel="noopener"
+                        class="text-sm text-white hover:text-accent hover:underline truncate inline-flex items-center gap-1"
+                        title="${esc(c.repo)} · open on GitHub">Slopsmith
+                        <svg class="w-3 h-3 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+                    </a>
+                    <div class="text-xs text-gray-500 truncate">${esc(c.repo)} · ${esc(c.branch || 'main')}</div>
+                </div>
+                <span class="w-24 text-center text-xs text-gray-400 font-mono hidden sm:block">${esc(localStr)}</span>
+                <span class="w-24 text-center text-xs text-gray-400 font-mono hidden sm:block">${esc(remoteStr)}</span>
+                <span class="w-28 text-center">${statusHtml}</span>
+                <span class="w-20 text-center">${exclCheckbox}</span>
+                <span class="w-40 text-center">${actionHtml}</span>
+            </div>`;
+
+        if (c.rebuild_required && !c.excluded) {
+            rebuildBanner.classList.remove('hidden');
+            if (c.rebuild_command) rebuildCmdEl.textContent = c.rebuild_command;
+            rebuildFilesEl.innerHTML = (c.blockers || [])
+                .map(b => `<li>${esc(b.status || '?')}  ${esc(b.filename)}</li>`)
+                .join('');
+        } else {
+            rebuildBanner.classList.add('hidden');
+        }
+    }
+
+    window.updaterCopyRebuildCmd = async function () {
+        const btn = document.getElementById('updater-rebuild-copy-btn');
+        const cmd = document.getElementById('updater-rebuild-cmd').textContent;
+        try {
+            await navigator.clipboard.writeText(cmd);
+            btn.textContent = 'Copied';
+            setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+        } catch (e) {
+            btn.textContent = 'Copy failed';
+        }
+    };
+
+    window.updaterInitCore = async function (btn) {
+        btn.disabled = true;
+        const orig = btn.textContent;
+        btn.textContent = 'Initializing...';
+        try {
+            const resp = await fetch(API + '/core/init', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+            });
+            const data = await resp.json();
+            if (data.ok) {
+                await updaterReloadCore();
+            } else {
+                btn.disabled = false;
+                btn.textContent = 'Failed';
+                btn.title = data.error || '';
+            }
+        } catch (e) {
+            btn.disabled = false;
+            btn.textContent = orig;
+            btn.title = e.message;
+        }
+    };
+
+    window.updaterUpdateCore = async function (btn) {
+        return updaterDoCoreUpdate(btn);
+    };
+
+    async function updaterDoCoreUpdate(btn) {
+        btn.disabled = true;
+        const orig = btn.textContent;
+        btn.textContent = 'Updating...';
+        try {
+            const resp = await fetch(API + '/core/update', { method: 'POST' });
+            const data = await resp.json();
+            if (data.ok) {
+                btn.outerHTML = '<span class="text-green-400 text-xs font-semibold">Updated</span>';
+                localStorage.setItem(RESTART_KEY, '1');
+                document.getElementById('updater-restart-banner').classList.remove('hidden');
+                await updaterReloadCore();
+                return true;
+            }
+            if (data.error === 'rebuild_required') {
+                btn.disabled = false;
+                btn.textContent = 'Blocked';
+                btn.className = 'bg-amber-900/30 text-amber-400 px-3 py-1 rounded-lg text-xs';
+                btn.title = data.message || 'Rebuild required';
+                await updaterReloadCore();
+                return false;
+            }
+            btn.disabled = false;
+            btn.textContent = 'Failed';
+            btn.title = data.error || 'Unknown error';
+            btn.className = 'bg-red-900/30 text-red-400 px-3 py-1 rounded-lg text-xs';
+            return false;
+        } catch (e) {
+            btn.disabled = false;
+            btn.textContent = orig;
+            btn.title = e.message;
+            return false;
+        }
+    }
+
+    async function updaterReloadCore() {
+        try {
+            const r = await fetch(API + '/core');
+            coreStatus = await r.json();
+            updaterRenderCore();
+        } catch (e) { /* ignore */ }
+    }
+
+    function updaterRenderUpdates() {
+        const c = document.getElementById('updater-table');
+        if (!plugins.length) {
+            c.innerHTML = '<div class="text-gray-500 text-sm py-8 text-center">No plugins installed.</div>';
+            return;
+        }
+
+        let html = `<div class="grid grid-cols-[1fr_auto_auto_auto_auto_auto] gap-x-4 text-xs text-gray-500 font-semibold uppercase tracking-wider px-3 py-2 border-b border-gray-800">
+            <span>Plugin</span>
+            <span class="w-24 text-center hidden sm:block">Local</span>
+            <span class="w-24 text-center hidden sm:block">Remote</span>
+            <span class="w-28 text-center">Status</span>
+            <span class="w-20 text-center" title="Exclude from automatic updates">Exclude</span>
+            <span class="w-40 text-center">Action</span>
+        </div>`;
+
+        for (const p of plugins) {
+            const u = updates[p.id];
+            const err = updateErrors[p.id];
+            const isExcluded = excluded.has(p.id);
+            const isSelf = p.id === 'update_manager';
+
+            let statusHtml, actionHtml, rowBg, localStr = '', remoteStr = '';
+            if (isExcluded) {
+                rowBg = 'bg-dark-900/40 opacity-60';
+                statusHtml = `<span class="text-gray-500 font-semibold text-xs">Excluded</span>
+                    <div class="text-[10px] text-gray-600 mt-0.5">Updates disabled</div>`;
+                actionHtml = `<button data-plugin-id="${esc(p.id)}" onclick="updaterUninstall(this)"
+                    class="text-gray-600 hover:text-red-400 text-xs transition">Uninstall</button>`;
+            } else if (u) {
+                rowBg = 'bg-dark-700/40';
+                localStr = u.local;
+                remoteStr = u.remote;
+                statusHtml = `<span class="text-amber-400 font-semibold text-xs">Update available</span>
+                    <div class="text-[10px] text-gray-600 mt-0.5">${esc(u.repo)} · ${esc(u.branch)}</div>`;
+                actionHtml = `<button data-plugin-id="${esc(p.id)}" onclick="updaterUpdate(this)"
+                    class="bg-accent/20 hover:bg-accent/30 text-accent px-3 py-1 rounded-lg text-xs transition">Update</button>`;
+            } else if (err) {
+                rowBg = 'bg-dark-800/30';
+                statusHtml = `<span class="text-red-400 text-xs" title="${esc(err)}">Check failed</span>`;
+                actionHtml = `<span class="text-gray-600 text-xs">—</span>`;
+            } else if (isSelf) {
+                rowBg = 'bg-dark-800/30';
+                statusHtml = `<span class="text-gray-500 text-xs">Self</span>`;
+                actionHtml = `<span class="text-gray-600 text-xs">—</span>`;
+            } else {
+                rowBg = 'bg-dark-800/30';
+                statusHtml = `<span class="text-green-400 font-semibold text-xs">Up to date</span>`;
+                actionHtml = `<button data-plugin-id="${esc(p.id)}" onclick="updaterUninstall(this)"
+                    class="text-gray-600 hover:text-red-400 text-xs transition">Uninstall</button>`;
+            }
+
+            const exclCheckbox = isSelf
+                ? '<span class="text-gray-700 text-xs">—</span>'
+                : `<label class="inline-flex items-center justify-center cursor-pointer" title="Exclude this plugin from update checks and bulk updates">
+                    <input type="checkbox" data-plugin-id="${esc(p.id)}" onchange="updaterToggleExclude(this)"
+                        ${isExcluded ? 'checked' : ''}
+                        class="accent-amber-500 w-3.5 h-3.5 rounded">
+                </label>`;
+
+            const src = sources[p.id];
+            const nameHtml = src
+                ? `<a href="${esc(src.url)}" target="_blank" rel="noopener"
+                        class="text-sm text-white hover:text-accent hover:underline truncate inline-flex items-center gap-1"
+                        title="${esc(src.repo)} · open on GitHub">${esc(p.name)}
+                        <svg class="w-3 h-3 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+                    </a>`
+                : `<div class="text-sm text-white truncate">${esc(p.name)}</div>`;
+
+            html += `<div class="grid grid-cols-[1fr_auto_auto_auto_auto_auto] gap-x-4 items-center px-3 py-2.5 rounded-lg ${rowBg} transition" data-row-id="${esc(p.id)}">
+                <div class="min-w-0">
+                    ${nameHtml}
+                    <div class="text-xs text-gray-500 truncate">${esc(p.id)}</div>
+                </div>
+                <span class="w-24 text-center text-xs text-gray-400 font-mono hidden sm:block">${esc(localStr)}</span>
+                <span class="w-24 text-center text-xs text-gray-400 font-mono hidden sm:block">${esc(remoteStr)}</span>
+                <span class="w-28 text-center">${statusHtml}</span>
+                <span class="w-20 text-center">${exclCheckbox}</span>
+                <span class="w-40 text-center">${actionHtml}</span>
+            </div>`;
+        }
+        c.innerHTML = html;
+    }
+
+    window.updaterToggleExclude = async function (cb) {
+        const id = cb.dataset.pluginId;
+        const shouldExclude = cb.checked;
+        cb.disabled = true;
+        try {
+            const resp = await fetch(API + '/exclusions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ plugin_id: id, excluded: shouldExclude }),
+            });
+            const data = await resp.json();
+            if (data.ok) {
+                excluded = new Set(data.excluded || []);
+                if (id === CORE_KEY) {
+                    if (coreStatus) coreStatus.excluded = shouldExclude;
+                    updaterRenderCore();
+                } else if (shouldExclude) {
+                    delete updates[id];
+                    delete updateErrors[id];
+                }
+                updaterRenderUpdates();
+                const pluginCount = Object.keys(updates).length;
+                const coreBehind = !!(coreStatus && coreStatus.behind && !coreStatus.excluded);
+                const total = pluginCount + (coreBehind ? 1 : 0);
+                document.getElementById('updater-status').textContent = total === 0
+                    ? 'Everything up to date.'
+                    : total + ' update' + (total > 1 ? 's' : '') + ' available';
+                const coreUpdatable = coreBehind && !coreStatus.rebuild_required;
+                document.getElementById('updater-update-all-btn')
+                    .classList.toggle('hidden', pluginCount === 0 && !coreUpdatable);
+            } else {
+                cb.checked = !shouldExclude;
+                cb.title = data.error || 'Failed';
+            }
+        } catch (e) {
+            cb.checked = !shouldExclude;
+            cb.title = e.message;
+        } finally {
+            cb.disabled = false;
+        }
+    };
+
+    // ── Update one ─────────────────────────────────────────────────────
+    window.updaterUpdate = async function (btn) {
+        return updaterDoUpdate(btn.dataset.pluginId, btn);
+    };
+
+    async function updaterDoUpdate(id, btn) {
+        btn.disabled = true;
+        const orig = btn.textContent;
+        btn.textContent = 'Updating...';
+        try {
+            const resp = await fetch(API + '/update/' + encodeURIComponent(id), { method: 'POST' });
+            const data = await resp.json();
+            if (data.ok) {
+                btn.outerHTML = '<span class="text-green-400 text-xs font-semibold">Updated</span>';
+                localStorage.setItem(RESTART_KEY, '1');
+                document.getElementById('updater-restart-banner').classList.remove('hidden');
+                return true;
+            }
+            btn.disabled = false;
+            btn.textContent = 'Failed';
+            btn.title = data.error || 'Unknown error';
+            btn.className = 'bg-red-900/30 text-red-400 px-3 py-1 rounded-lg text-xs';
+            return false;
+        } catch (e) {
+            btn.disabled = false;
+            btn.textContent = orig;
+            btn.title = e.message;
+            return false;
+        }
+    }
+
+    window.updaterUpdateAll = async function () {
+        const allBtn = document.getElementById('updater-update-all-btn');
+        allBtn.disabled = true;
+        allBtn.textContent = 'Updating all...';
+
+        // Core first — if it's behind, applicable, and not blocked.
+        if (coreStatus && coreStatus.behind && !coreStatus.excluded && !coreStatus.rebuild_required) {
+            const coreCard = document.getElementById('updater-core-card');
+            const coreBtn = coreCard ? coreCard.querySelector('button[onclick^="updaterUpdateCore"]') : null;
+            if (coreBtn) await updaterDoCoreUpdate(coreBtn);
+        }
+
+        for (const id of Object.keys(updates)) {
+            if (excluded.has(id)) continue;
+            const row = document.querySelector('[data-row-id="' + CSS.escape(id) + '"]');
+            const btn = row ? row.querySelector('button[data-plugin-id]') : null;
+            if (!btn) continue;
+            await updaterDoUpdate(id, btn);
+        }
+        allBtn.classList.add('hidden');
+        allBtn.disabled = false;
+        allBtn.textContent = 'Update all';
+    };
+
+    // ── Uninstall ──────────────────────────────────────────────────────
+    window.updaterUninstall = async function (btn) {
+        const id = btn.dataset.pluginId;
+        if (!confirm('Uninstall plugin "' + id + '"?\n\nThis removes its directory. Any local edits will be lost.')) return;
+        btn.disabled = true;
+        btn.textContent = 'Removing...';
+        try {
+            const resp = await fetch(API + '/uninstall/' + encodeURIComponent(id), { method: 'POST' });
+            const data = await resp.json();
+            if (data.ok) {
+                btn.outerHTML = '<span class="text-green-400 text-xs font-semibold">Removed</span>';
+                localStorage.setItem(RESTART_KEY, '1');
+                document.getElementById('updater-restart-banner').classList.remove('hidden');
+            } else {
+                btn.disabled = false;
+                btn.textContent = 'Failed';
+                btn.title = data.error || '';
+            }
+        } catch (e) {
+            btn.disabled = false;
+            btn.textContent = 'Error';
+            btn.title = e.message;
+        }
+    };
+
+    // ── Registry / Browse ──────────────────────────────────────────────
+    window.updaterLoadRegistry = async function () {
+        const btn = document.getElementById('updater-reload-btn');
+        const loading = document.getElementById('updater-browse-loading');
+        const status = document.getElementById('updater-browse-status');
+        btn.disabled = true;
+        btn.textContent = 'Loading...';
+        loading.classList.remove('hidden');
+        status.textContent = '';
+        try {
+            const resp = await fetch(API + '/registry');
+            const data = await resp.json();
+            if (data.error) throw new Error(data.error);
+            registry = data.entries || [];
+            status.textContent = registry.length + ' plugins in registry';
+            updaterRenderBrowse();
+        } catch (e) {
+            status.textContent = 'Failed: ' + e.message;
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Reload registry';
+            loading.classList.add('hidden');
+        }
+    };
+
+    window.updaterRenderBrowse = function () {
+        const container = document.getElementById('updater-browse-list');
+        const filter = (document.getElementById('updater-browse-filter').value || '').toLowerCase().trim();
+        const installedSet = new Set(plugins.map(p => p.id));
+
+        let rows = registry;
+        if (filter) {
+            rows = rows.filter(r =>
+                r.name.toLowerCase().includes(filter) ||
+                r.description.toLowerCase().includes(filter) ||
+                r.dirname.toLowerCase().includes(filter) ||
+                r.repo.toLowerCase().includes(filter));
+        }
+
+        if (!rows.length) {
+            container.innerHTML = '<div class="text-gray-500 text-sm py-8 text-center">No plugins match.</div>';
+            return;
+        }
+
+        let html = '';
+        for (const r of rows) {
+            const installed = r.installed || installedSet.has(r.dirname);
+            const action = installed
+                ? '<span class="text-green-400 text-xs font-semibold">Installed</span>'
+                : `<button data-url="${esc(r.url)}" data-dirname="${esc(r.dirname)}" onclick="updaterInstall(this)"
+                    class="bg-accent/20 hover:bg-accent/30 text-accent px-3 py-1 rounded-lg text-xs transition">Install</button>`;
+
+            html += `<div class="flex items-start gap-3 bg-dark-700/40 rounded-lg px-4 py-3">
+                <div class="flex-1 min-w-0">
+                    <div class="flex items-center gap-2 flex-wrap">
+                        <a href="${esc(r.url)}" target="_blank" class="text-sm text-white hover:text-accent truncate">${esc(r.name)}</a>
+                        <span class="text-[10px] text-gray-600 font-mono">${esc(r.repo)}</span>
+                    </div>
+                    <div class="text-xs text-gray-500 mt-0.5">${esc(r.description)}</div>
+                    <div class="text-[10px] text-gray-600 mt-1 font-mono">dir: ${esc(r.dirname)}</div>
+                </div>
+                <div class="shrink-0 self-center">${action}</div>
+            </div>`;
+        }
+        container.innerHTML = html;
+    };
+
+    window.updaterInstall = async function (btn) {
+        const url = btn.dataset.url;
+        const dirname = btn.dataset.dirname;
+        btn.disabled = true;
+        btn.textContent = 'Installing...';
+        try {
+            const resp = await fetch(API + '/install', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url, dirname }),
+            });
+            const data = await resp.json();
+            if (data.ok) {
+                btn.outerHTML = '<span class="text-green-400 text-xs font-semibold">Installed</span>';
+                localStorage.setItem(RESTART_KEY, '1');
+                document.getElementById('updater-restart-banner').classList.remove('hidden');
+                // Refresh cached plugin list so Updates tab reflects the new install
+                try {
+                    const pRes = await fetch('/api/plugins');
+                    plugins = await pRes.json();
+                } catch (e) { /* ignore */ }
+            } else {
+                btn.disabled = false;
+                btn.textContent = 'Failed';
+                btn.title = data.error || '';
+                btn.className = 'bg-red-900/30 text-red-400 px-3 py-1 rounded-lg text-xs';
+            }
+        } catch (e) {
+            btn.disabled = false;
+            btn.textContent = 'Error';
+            btn.title = e.message;
+        }
+    };
+
+    // ── Restart banner ─────────────────────────────────────────────────
+    window.updaterCopyCmd = async function () {
+        const btn = document.getElementById('updater-copy-btn');
+        try {
+            await navigator.clipboard.writeText('docker compose restart');
+            btn.textContent = 'Copied';
+            setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+        } catch (e) {
+            btn.textContent = 'Copy failed';
+        }
+    };
+
+    window.updaterRestart = async function () {
+        const btn = document.getElementById('updater-restart-btn');
+        const copyBtn = document.getElementById('updater-copy-btn');
+        const statusEl = document.getElementById('updater-restart-status');
+        const origLabel = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = 'Restarting...';
+        if (copyBtn) copyBtn.disabled = true;
+        statusEl.classList.remove('hidden');
+        statusEl.className = 'text-xs text-gray-400 mb-2';
+        statusEl.textContent = 'Sending restart signal...';
+
+        try {
+            await fetch(API + '/restart', { method: 'POST' });
+        } catch (e) {
+            // Connection may drop as the process re-execs. Expected.
+        }
+
+        statusEl.textContent = 'Waiting for server to come back...';
+        const start = Date.now();
+        const deadline = start + 30000;
+        let back = false;
+        // Give uvicorn a moment to tear down before we start polling
+        await new Promise(r => setTimeout(r, 1500));
+        while (Date.now() < deadline) {
+            try {
+                const r = await fetch('/api/plugins', { cache: 'no-store' });
+                if (r.ok) { back = true; break; }
+            } catch (e) { /* still down */ }
+            await new Promise(r => setTimeout(r, 1000));
+        }
+
+        if (back) {
+            localStorage.removeItem(RESTART_KEY);
+            document.getElementById('updater-restart-banner').classList.add('hidden');
+            const elapsed = Math.round((Date.now() - start) / 100) / 10;
+            const s = document.getElementById('updater-status');
+            if (s) {
+                s.textContent = 'Restarted in ' + elapsed + 's.';
+                s.className = 'text-xs text-green-400';
+            }
+            if (currentTab === 'updates') updaterCheck();
+        } else {
+            btn.disabled = false;
+            btn.textContent = origLabel;
+            if (copyBtn) copyBtn.disabled = false;
+            statusEl.className = 'text-xs text-red-400 mb-2';
+            statusEl.textContent = 'Restart timed out after 30s. Try docker compose restart and refresh the page.';
+        }
+    };
+
+    window.updaterDismissBanner = function () {
+        document.getElementById('updater-restart-banner').classList.add('hidden');
+        localStorage.removeItem(RESTART_KEY);
+    };
+
+    // ── Utility ────────────────────────────────────────────────────────
+    function esc(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+})();

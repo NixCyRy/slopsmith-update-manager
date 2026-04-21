@@ -1,0 +1,92 @@
+<div class="max-w-5xl mx-auto px-6 pt-24 pb-16">
+    <button onclick="showScreen('home')" class="text-gray-500 hover:text-white text-sm mb-6 flex items-center gap-1">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg> Back
+    </button>
+    <h2 class="text-3xl font-bold text-white mb-2">Update Manager</h2>
+    <p class="text-gray-500 mb-6">Install and update slopsmith plugins, and keep the slopsmith core itself in sync — all without leaving the browser.</p>
+
+    <!-- Restart-required banner -->
+    <div id="updater-restart-banner" class="hidden mb-6 bg-dark-700 border border-green-500/30 rounded-xl p-5">
+        <div class="flex items-start gap-3">
+            <svg class="w-5 h-5 text-green-400 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+            </svg>
+            <div class="flex-1">
+                <p class="text-green-300 text-sm font-semibold mb-1">Changes applied</p>
+                <p class="text-gray-400 text-xs mb-3">Restart the server so the new code loads. The easiest option is in-place restart below; alternatively run <code class="bg-dark-800 px-1 rounded">docker compose restart</code> yourself.</p>
+                <div class="flex items-center gap-2 mb-3 flex-wrap">
+                    <button onclick="updaterRestart()" id="updater-restart-btn"
+                        class="bg-accent hover:bg-accent/80 px-4 py-1.5 rounded-lg text-xs text-white font-semibold transition">Restart now</button>
+                    <code class="bg-dark-800 border border-gray-800 rounded-lg px-3 py-1.5 text-xs text-gray-400 font-mono">docker compose restart</code>
+                    <button onclick="updaterCopyCmd()" id="updater-copy-btn"
+                        class="bg-dark-600 hover:bg-dark-500 px-3 py-1.5 rounded-lg text-xs text-gray-300 transition">Copy</button>
+                </div>
+                <div id="updater-restart-status" class="text-xs text-gray-500 mb-2 hidden"></div>
+                <button onclick="updaterDismissBanner()" class="text-gray-500 hover:text-white text-xs">Dismiss</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="flex items-center gap-2 border-b border-gray-800 mb-6">
+        <button onclick="updaterTab('updates')" id="updater-tab-updates"
+            class="px-4 py-2 text-sm transition border-b-2 border-accent text-white">Installed &amp; Updates</button>
+        <button onclick="updaterTab('browse')" id="updater-tab-browse"
+            class="px-4 py-2 text-sm transition border-b-2 border-transparent text-gray-500 hover:text-white">Browse Registry</button>
+        <span class="flex-1"></span>
+        <span id="updater-last-checked" class="text-xs text-gray-600"></span>
+    </div>
+
+    <!-- Updates tab -->
+    <div id="updater-pane-updates">
+        <div class="flex items-center gap-3 mb-4 flex-wrap">
+            <button onclick="updaterCheck()" id="updater-check-btn"
+                class="bg-dark-600 hover:bg-dark-500 px-4 py-2 rounded-xl text-sm text-gray-300 transition">Check for updates</button>
+            <button onclick="updaterUpdateAll()" id="updater-update-all-btn"
+                class="hidden bg-accent hover:bg-accent/80 px-4 py-2 rounded-xl text-sm text-white font-semibold transition">Update all</button>
+            <span id="updater-status" class="text-xs text-gray-500"></span>
+        </div>
+
+        <!-- Rebuild-required banner (shown when core has unmounted-file changes) -->
+        <div id="updater-rebuild-banner" class="hidden mb-4 bg-dark-700 border border-amber-500/30 rounded-xl p-5">
+            <div class="flex items-start gap-3">
+                <svg class="w-5 h-5 text-amber-400 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M4.93 4.93l14.14 14.14M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                </svg>
+                <div class="flex-1 min-w-0">
+                    <p class="text-amber-300 text-sm font-semibold mb-1">Core update requires container rebuild</p>
+                    <p class="text-gray-400 text-xs mb-2">Upstream commits touch files that aren't bind-mounted into the container (e.g. <code class="bg-dark-800 px-1 rounded">Dockerfile</code>, <code class="bg-dark-800 px-1 rounded">requirements.txt</code>). Pull and rebuild manually on the host:</p>
+                    <div class="flex items-center gap-2 mb-2 flex-wrap">
+                        <code id="updater-rebuild-cmd" class="bg-dark-800 border border-gray-800 rounded-lg px-3 py-1.5 text-xs text-gray-300 font-mono break-all">cd slopsmith &amp;&amp; git pull &amp;&amp; docker compose build web &amp;&amp; docker compose up -d</code>
+                        <button onclick="updaterCopyRebuildCmd()" id="updater-rebuild-copy-btn"
+                            class="bg-dark-600 hover:bg-dark-500 px-3 py-1.5 rounded-lg text-xs text-gray-300 transition">Copy</button>
+                    </div>
+                    <details class="text-xs text-gray-500">
+                        <summary class="cursor-pointer hover:text-gray-300">Show blocked files</summary>
+                        <ul id="updater-rebuild-files" class="mt-2 space-y-0.5 font-mono text-[11px] text-gray-400"></ul>
+                    </details>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slopsmith Core card -->
+        <div id="updater-core-card" class="hidden mb-4"></div>
+
+        <div id="updater-loading" class="hidden text-gray-500 text-sm py-8 text-center">Checking GitHub for latest commits...</div>
+        <div id="updater-table"></div>
+    </div>
+
+    <!-- Browse tab -->
+    <div id="updater-pane-browse" class="hidden">
+        <div class="flex items-center gap-3 mb-4 flex-wrap">
+            <input type="text" id="updater-browse-filter" placeholder="Filter plugins..."
+                oninput="updaterRenderBrowse()"
+                class="flex-1 bg-dark-700 border border-gray-800 rounded-xl px-4 py-2 text-sm text-gray-300 placeholder-gray-600 focus:border-accent/50 outline-none">
+            <button onclick="updaterLoadRegistry()" id="updater-reload-btn"
+                class="bg-dark-600 hover:bg-dark-500 px-4 py-2 rounded-xl text-sm text-gray-300 transition">Reload registry</button>
+            <span id="updater-browse-status" class="text-xs text-gray-500"></span>
+        </div>
+        <div id="updater-browse-loading" class="hidden text-gray-500 text-sm py-8 text-center">Fetching registry from GitHub...</div>
+        <div id="updater-browse-list" class="space-y-2"></div>
+    </div>
+</div>
