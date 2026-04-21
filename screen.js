@@ -321,7 +321,14 @@
                     class="bg-accent/20 hover:bg-accent/30 text-accent px-3 py-1 rounded-lg text-xs transition">Update</button>`;
             } else if (err) {
                 rowBg = 'bg-dark-800/30';
-                statusHtml = `<span class="text-red-400 text-xs" title="${esc(err)}">Check failed</span>`;
+                const errObj = (typeof err === 'object' && err !== null) ? err : { code: 'error', message: String(err) };
+                if (errObj.code === 'branch_not_on_remote') {
+                    const br = errObj.branch || 'unknown';
+                    statusHtml = `<span class="text-sky-400 font-semibold text-xs" title="Switch to the published branch (usually main), or push '${esc(br)}' to origin">Branch not published</span>
+                        <div class="text-[10px] text-gray-600 mt-0.5">Local branch <code class="text-gray-400">${esc(br)}</code> not on remote</div>`;
+                } else {
+                    statusHtml = `<span class="text-red-400 text-xs" title="${esc(errObj.message || 'Check failed')}">Check failed</span>`;
+                }
                 actionHtml = `<span class="text-gray-600 text-xs">—</span>`;
             } else if (isSelf) {
                 rowBg = 'bg-dark-800/30';

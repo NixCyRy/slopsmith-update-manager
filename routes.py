@@ -456,10 +456,20 @@ def setup(app, context):
             try:
                 remote_sha = _latest_sha(owner, repo, branch)
             except urllib.error.HTTPError as e:
-                errors[name] = f"HTTP {e.code}"
+                if e.code == 422:
+                    errors[name] = {
+                        "code": "branch_not_on_remote",
+                        "branch": branch,
+                        "message": f"Local branch '{branch}' not on {owner}/{repo}",
+                    }
+                else:
+                    errors[name] = {
+                        "code": "http",
+                        "message": f"HTTP {e.code}: {e.reason}",
+                    }
                 continue
             except Exception as e:
-                errors[name] = str(e)
+                errors[name] = {"code": "error", "message": str(e)}
                 continue
             if remote_sha and remote_sha != info["local_sha"]:
                 results[name] = {
