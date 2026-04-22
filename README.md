@@ -20,6 +20,9 @@ A plugin for [Slopsmith](https://github.com/byrongamatos/slopsmith) that install
 
 ## What's New
 
+### v1.5.0
+- **Ignore non-core files** — updates to documentation (`*.md`, `docs/`), tests (`tests/`), and Claude config (`.claude/`) no longer block core updates. These paths are silently skipped during both blocker detection and extraction.
+
 ### v1.4.0
 - **Slopsmith core tracking** — a new "Slopsmith Core" row appears above the plugin table. Click **Initialize tracking** once to stamp the current commit, then the card reports behind/ahead state against `byrongamatos/slopsmith`.
 - **Non-destructive core overlay** — updates write only the files that exist in the upstream zip; files present locally and absent from the zip (e.g. `static/audio_*.mp3`, `__pycache__/`, every installed plugin dir) are left alone.

@@ -8,6 +8,7 @@ each plugin directory. For plugins that were installed via host-side
 to infer origin and local commit.
 """
 
+import fnmatch
 import io
 import json
 import os
@@ -37,7 +38,7 @@ EXCL_FILE = CACHE_DIR / "exclusions.json"
 CORE_REPO_OWNER = "byrongamatos"
 CORE_REPO_NAME = "slopsmith"
 CORE_MOUNTED_PATHS = {"server.py", "ug_browser.py", "lib", "static"}
-CORE_IGNORED_PATHS = {"plugins"}
+CORE_IGNORED_PATHS = {"plugins", "*.md", "docs", "tests", ".claude"}
 CORE_MARKER_FILE = CACHE_DIR / "core.json"
 CORE_EXCLUSION_KEY = "__core__"
 APP_ROOT = Path("/app")
@@ -316,6 +317,15 @@ def _core_changed_files(local_sha: str, remote_sha: str) -> list[dict]:
     return [{"filename": f.get("filename", ""), "status": f.get("status", "")} for f in files]
 
 
+def _is_ignored(path: str) -> bool:
+    """Check if path matches any pattern in CORE_IGNORED_PATHS, supporting fnmatch wildcards."""
+    top = path.split("/", 1)[0]
+    for pattern in CORE_IGNORED_PATHS:
+        if fnmatch.fnmatch(top, pattern):
+            return True
+    return False
+
+
 def _classify_core_changes(files: list[dict]) -> tuple[list[dict], list[dict]]:
     """Split changed files into (writable_to_mount, blockers).
 
@@ -327,9 +337,9 @@ def _classify_core_changes(files: list[dict]) -> tuple[list[dict], list[dict]]:
         name = f.get("filename", "")
         if not name:
             continue
-        top = name.split("/", 1)[0]
-        if top in CORE_IGNORED_PATHS:
+        if _is_ignored(name):
             continue
+        top = name.split("/", 1)[0]
         if top in CORE_MOUNTED_PATHS:
             writable.append(f)
         else:
@@ -353,9 +363,9 @@ def _download_core_stage(branch: str) -> tuple[Path, str]:
         rel = m[len(prefix):]
         if not rel or ".." in Path(rel).parts:
             continue
-        top = rel.split("/", 1)[0]
-        if top in CORE_IGNORED_PATHS:
+        if _is_ignored(rel):
             continue
+        top = rel.split("/", 1)[0]
         if top not in CORE_MOUNTED_PATHS:
             continue
         out = stage / rel
