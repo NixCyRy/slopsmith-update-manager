@@ -22,6 +22,7 @@ A plugin for [Slopsmith](https://github.com/byrongamatos/slopsmith) that install
 
 ### v1.5.0
 - **Ignore non-core files** — updates to documentation (`*.md`, `docs/`), tests (`tests/`), and Claude config (`.claude/`) no longer block core updates. These paths are silently skipped during both blocker detection and extraction.
+- **Self-update** — the Update Manager can now update itself. When an update is available, clicking Update downloads the new version to a staging area, then prompts you to restart to apply it.
 
 ### v1.4.0
 - **Slopsmith core tracking** — a new "Slopsmith Core" row appears above the plugin table. Click **Initialize tracking** once to stamp the current commit, then the card reports behind/ahead state against `byrongamatos/slopsmith`.

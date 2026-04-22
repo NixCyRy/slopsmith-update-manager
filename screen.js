@@ -332,8 +332,17 @@
                 actionHtml = `<span class="text-gray-600 text-xs">—</span>`;
             } else if (isSelf) {
                 rowBg = 'bg-dark-800/30';
-                statusHtml = `<span class="text-gray-500 text-xs">Self</span>`;
-                actionHtml = `<span class="text-gray-600 text-xs">—</span>`;
+                if (u) {
+                    localStr = u.local;
+                    remoteStr = u.remote;
+                    statusHtml = `<span class="text-amber-400 font-semibold text-xs">Update available</span>
+                        <div class="text-[10px] text-gray-600 mt-0.5">${esc(u.repo)} · ${esc(u.branch)}</div>`;
+                    actionHtml = `<button data-plugin-id="${esc(p.id)}" onclick="updaterUpdate(this)"
+                        class="bg-accent/20 hover:bg-accent/30 text-accent px-3 py-1 rounded-lg text-xs transition">Update</button>`;
+                } else {
+                    statusHtml = `<span class="text-gray-500 text-xs">Self</span>`;
+                    actionHtml = `<span class="text-gray-600 text-xs">—</span>`;
+                }
             } else {
                 rowBg = 'bg-dark-800/30';
                 statusHtml = `<span class="text-green-400 font-semibold text-xs">Up to date</span>`;
@@ -428,6 +437,12 @@
             const resp = await fetch(API + '/update/' + encodeURIComponent(id), { method: 'POST' });
             const data = await resp.json();
             if (data.ok) {
+                if (data.pending_restart) {
+                    btn.outerHTML = '<span class="text-amber-400 text-xs font-semibold">Restart to apply</span>';
+                    localStorage.setItem(RESTART_KEY, '1');
+                    document.getElementById('updater-restart-banner').classList.remove('hidden');
+                    return true;
+                }
                 btn.outerHTML = '<span class="text-green-400 text-xs font-semibold">Updated</span>';
                 localStorage.setItem(RESTART_KEY, '1');
                 document.getElementById('updater-restart-banner').classList.remove('hidden');

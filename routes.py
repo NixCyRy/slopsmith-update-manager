@@ -43,6 +43,7 @@ CORE_MARKER_FILE = CACHE_DIR / "core.json"
 CORE_EXCLUSION_KEY = "__core__"
 APP_ROOT = Path("/app")
 REBUILD_CMD = "cd slopsmith && git pull && docker compose build web && docker compose up -d"
+SELF_UPDATE_STAGING = CACHE_DIR / "self_update"
 
 
 def _load_exclusions() -> set[str]:
@@ -395,6 +396,67 @@ def _overlay_core(stage: Path) -> list[str]:
     return written
 
 
+def _self_update(owner: str, repo: str, branch: str, sha: str) -> dict:
+    """Download new version to staging and mark for pending restart.
+
+    Returns {"ok": true, "pending_restart": true} so the UI can prompt
+    the user to restart. On restart, _apply_pending_self_update will
+    swap the files before re-execing the server.
+    """
+    staging = SELF_UPDATE_STAGING
+    if staging.exists():
+        shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+
+    url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
+    data = _http_get(url, timeout=120)
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    members = [m for m in zf.namelist() if not m.endswith("/")]
+    if not members:
+        return {"error": "Empty archive"}
+    prefix = members[0].split("/")[0] + "/"
+
+    for m in members:
+        if not m.startswith(prefix):
+            continue
+        rel = m[len(prefix):]
+        if not rel or ".." in Path(rel).parts:
+            continue
+        out = staging / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(zf.read(m))
+
+    marker = staging / ".self_update_pending"
+    marker.write_text(json.dumps({
+        "owner": owner, "repo": repo,
+        "branch": branch, "sha": sha,
+        "staged_at": int(time.time()),
+    }, indent=2))
+    return {"ok": True, "pending_restart": True, "sha": sha[:7], "branch": branch}
+
+
+def _apply_pending_self_update(target: Path) -> bool:
+    """Swap staged self-update files into target dir. Returns True if swap occurred."""
+    marker = SELF_UPDATE_STAGING / ".self_update_pending"
+    if not marker.exists():
+        return False
+    staging = SELF_UPDATE_STAGING
+    if not staging.exists():
+        return False
+
+    for src in staging.rglob("*"):
+        if src.name.startswith("."):
+            continue
+        if not src.is_file():
+            continue
+        rel = src.relative_to(staging)
+        dst = target / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(src), str(dst))
+    shutil.rmtree(staging, ignore_errors=True)
+    return True
+
+
 def setup(app, context):
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -527,6 +589,8 @@ def setup(app, context):
             sha = _latest_sha(owner, repo, branch)
             if not sha:
                 return {"error": "Could not resolve latest commit"}
+            if plugin_id == "update_manager":
+                return _self_update(owner, repo, branch, sha)
             _download_and_replace(owner, repo, branch, target, preserve_git=(info["source"] == "git"))
             _write_marker(target, owner, repo, branch, sha)
             return {"ok": True, "sha": sha[:7], "branch": branch}
@@ -543,6 +607,11 @@ def setup(app, context):
         same PID. Parent shell (PID 1) sees no child exit, so the
         container stays alive. No docker-compose restart policy needed.
         """
+        plugin_target = PLUGINS_DIR / "update_manager"
+        if _apply_pending_self_update(plugin_target):
+            marker = SELF_UPDATE_STAGING / ".self_update_pending"
+            marker.unlink(missing_ok=True)
+
         # Snapshot the original argv before returning (after exec, this
         # function never runs to completion).
         try:
