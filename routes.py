@@ -31,7 +31,9 @@ GH_REPO_RE = re.compile(
 )
 MARKER = ".slopsmith-installed.json"
 UA = "slopsmith-update-manager/1.4"
-PLUGINS_DIR = Path(__file__).resolve().parent.parent
+_env_plugins = os.environ.get("SLOPSMITH_PLUGINS_DIR", "").strip()
+IS_DESKTOP = bool(_env_plugins)
+PLUGINS_DIR = Path(_env_plugins) if _env_plugins else Path(__file__).resolve().parent.parent
 CACHE_DIR = Path(os.environ.get("CONFIG_DIR", "/config")) / "update_manager"
 EXCL_FILE = CACHE_DIR / "exclusions.json"
 
@@ -460,6 +462,10 @@ def _apply_pending_self_update(target: Path) -> bool:
 def setup(app, context):
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+    @app.get("/api/plugins/update_manager/config")
+    def get_config():
+        return {"is_desktop": IS_DESKTOP}
+
     @app.get("/api/plugins/update_manager/registry")
     def registry():
         try:
@@ -607,6 +613,9 @@ def setup(app, context):
         same PID. Parent shell (PID 1) sees no child exit, so the
         container stays alive. No docker-compose restart policy needed.
         """
+        if IS_DESKTOP:
+            # Desktop restart is handled by the Electron renderer via slopsmithDesktop.plugins.restart().
+            return {"ok": True, "desktop": True}
         plugin_target = PLUGINS_DIR / "update_manager"
         if _apply_pending_self_update(plugin_target):
             marker = SELF_UPDATE_STAGING / ".self_update_pending"
@@ -644,6 +653,8 @@ def setup(app, context):
 
     @app.get("/api/plugins/update_manager/core")
     def core_status():
+        if IS_DESKTOP:
+            return {"is_desktop": True, "hidden": True}
         marker = _load_core_marker()
         excluded = CORE_EXCLUSION_KEY in _load_exclusions()
         try:
@@ -691,6 +702,8 @@ def setup(app, context):
 
     @app.post("/api/plugins/update_manager/core/init")
     async def core_init(body: dict):
+        if IS_DESKTOP:
+            return {"error": "Core updates are not supported in the desktop app."}
         sha = ((body or {}).get("sha") or "").strip() if isinstance(body, dict) else ""
         try:
             branch = _default_branch(CORE_REPO_OWNER, CORE_REPO_NAME)
@@ -707,6 +720,8 @@ def setup(app, context):
 
     @app.post("/api/plugins/update_manager/core/update")
     def core_update():
+        if IS_DESKTOP:
+            return {"error": "Core updates are not supported in the desktop app."}
         if CORE_EXCLUSION_KEY in _load_exclusions():
             return {"error": "Core is excluded from updates"}
         marker = _load_core_marker()

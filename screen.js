@@ -12,6 +12,7 @@
     let registry = [];       // API + '/registry' -> entries
     let coreStatus = null;   // API + '/core'
     let currentTab = 'updates';
+    let isDesktop = !!window.slopsmithDesktop?.isDesktop;
 
     // ── Screen show hook ───────────────────────────────────────────────
     const _origShowScreen = window.showScreen;
@@ -20,9 +21,17 @@
         if (id === 'plugin-update_manager') updaterOnShow();
     };
 
-    function updaterOnShow() {
+    async function updaterOnShow() {
+        try {
+            const r = await fetch(API + '/config');
+            const cfg = await r.json();
+            isDesktop = cfg.is_desktop ?? isDesktop;
+        } catch (e) { /* fall back to window.slopsmithDesktop */ }
         if (localStorage.getItem(RESTART_KEY) === '1') {
             document.getElementById('updater-restart-banner').classList.remove('hidden');
+        }
+        if (isDesktop) {
+            document.querySelectorAll('[data-docker-only]').forEach(el => el.classList.add('hidden'));
         }
         if (currentTab === 'updates') updaterCheck();
         else updaterLoadRegistry();
@@ -105,7 +114,11 @@
         const rebuildCmdEl = document.getElementById('updater-rebuild-cmd');
         const rebuildFilesEl = document.getElementById('updater-rebuild-files');
         if (!card) return;
-        if (!coreStatus) { card.classList.add('hidden'); rebuildBanner.classList.add('hidden'); return; }
+        if (!coreStatus || coreStatus.hidden) {
+            card.classList.add('hidden');
+            if (rebuildBanner) rebuildBanner.classList.add('hidden');
+            return;
+        }
 
         const c = coreStatus;
         card.classList.remove('hidden');
@@ -635,10 +648,10 @@
         statusEl.className = 'text-xs text-gray-400 mb-2';
         statusEl.textContent = 'Sending restart signal...';
 
-        try {
-            await fetch(API + '/restart', { method: 'POST' });
-        } catch (e) {
-            // Connection may drop as the process re-execs. Expected.
+        if (isDesktop) {
+            try { await window.slopsmithDesktop.plugins.restart(); } catch (e) { /* ignore */ }
+        } else {
+            try { await fetch(API + '/restart', { method: 'POST' }); } catch (e) { /* connection drop expected */ }
         }
 
         statusEl.textContent = 'Waiting for server to come back...';
@@ -670,7 +683,7 @@
             btn.textContent = origLabel;
             if (copyBtn) copyBtn.disabled = false;
             statusEl.className = 'text-xs text-red-400 mb-2';
-            statusEl.textContent = 'Restart timed out after 30s. Try docker compose restart and refresh the page.';
+            statusEl.textContent = 'Server did not respond within 30s. Try restarting the app.';
         }
     };
 

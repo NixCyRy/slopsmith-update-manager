@@ -17,8 +17,8 @@
                 <div class="flex items-center gap-2 mb-3 flex-wrap">
                     <button onclick="updaterRestart()" id="updater-restart-btn"
                         class="bg-accent hover:bg-accent/80 px-4 py-1.5 rounded-lg text-xs text-white font-semibold transition">Restart now</button>
-                    <code class="bg-dark-800 border border-gray-800 rounded-lg px-3 py-1.5 text-xs text-gray-400 font-mono">docker compose restart</code>
-                    <button onclick="updaterCopyCmd()" id="updater-copy-btn"
+                    <code data-docker-only class="bg-dark-800 border border-gray-800 rounded-lg px-3 py-1.5 text-xs text-gray-400 font-mono">docker compose restart</code>
+                    <button data-docker-only onclick="updaterCopyCmd()" id="updater-copy-btn"
                         class="bg-dark-600 hover:bg-dark-500 px-3 py-1.5 rounded-lg text-xs text-gray-300 transition">Copy</button>
                 </div>
                 <div id="updater-restart-status" class="text-xs text-gray-500 mb-2 hidden"></div>
