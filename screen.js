@@ -7,11 +7,13 @@
     let plugins = [];        // /api/plugins result (installed list)
     let updates = {};        // API + '/updates' -> { [id]: {local, remote, branch, source, repo} }
     let updateErrors = {};
-    let sources = {};        // { [id]: {repo, url, branch, source} } — GitHub origin for every resolvable plugin
+    let sources = {};        // { [id]: {repo, url, branch, source} | {bundled: true} }
     let excluded = new Set(); // plugin ids the user has opted out of updates for
+    let bundledIds = new Set(); // plugin ids that ship with slopsmith core (issue #1)
     let registry = [];       // API + '/registry' -> entries
     let coreStatus = null;   // API + '/core'
     let currentTab = 'updates';
+    let isDesktop = !!window.slopsmithDesktop?.isDesktop;
 
     // ── Screen show hook ───────────────────────────────────────────────
     const _origShowScreen = window.showScreen;
@@ -20,9 +22,17 @@
         if (id === 'plugin-update_manager') updaterOnShow();
     };
 
-    function updaterOnShow() {
+    async function updaterOnShow() {
+        try {
+            const r = await fetch(API + '/config');
+            const cfg = await r.json();
+            isDesktop = cfg.is_desktop ?? isDesktop;
+        } catch (e) { /* fall back to window.slopsmithDesktop */ }
         if (localStorage.getItem(RESTART_KEY) === '1') {
             document.getElementById('updater-restart-banner').classList.remove('hidden');
+        }
+        if (isDesktop) {
+            document.querySelectorAll('[data-docker-only]').forEach(el => el.classList.add('hidden'));
         }
         if (currentTab === 'updates') updaterCheck();
         else updaterLoadRegistry();
@@ -75,6 +85,7 @@
             updateErrors = uData.errors || {};
             sources = uData.sources || {};
             excluded = new Set(uData.excluded || []);
+            bundledIds = new Set(uData.bundled || []);
             coreStatus = await cRes.json();
             updaterRenderCore();
             updaterRenderUpdates();
@@ -105,7 +116,11 @@
         const rebuildCmdEl = document.getElementById('updater-rebuild-cmd');
         const rebuildFilesEl = document.getElementById('updater-rebuild-files');
         if (!card) return;
-        if (!coreStatus) { card.classList.add('hidden'); rebuildBanner.classList.add('hidden'); return; }
+        if (!coreStatus || coreStatus.hidden) {
+            card.classList.add('hidden');
+            if (rebuildBanner) rebuildBanner.classList.add('hidden');
+            return;
+        }
 
         const c = coreStatus;
         card.classList.remove('hidden');
@@ -303,9 +318,18 @@
             const err = updateErrors[p.id];
             const isExcluded = excluded.has(p.id);
             const isSelf = p.id === 'update_manager';
+            const isBundled = bundledIds.has(p.id) || p.bundled === true;
 
             let statusHtml, actionHtml, rowBg, localStr = '', remoteStr = '';
-            if (isExcluded) {
+            if (isBundled) {
+                rowBg = 'bg-dark-800/30';
+                statusHtml = `<span class="text-sky-400 font-semibold text-xs inline-flex items-center gap-1">
+                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
+                        Bundled
+                    </span>
+                    <div class="text-[10px] text-gray-600 mt-0.5">Managed by slopsmith core</div>`;
+                actionHtml = `<span class="text-gray-700 text-xs" title="Bundled plugins update with slopsmith itself">—</span>`;
+            } else if (isExcluded) {
                 rowBg = 'bg-dark-900/40 opacity-60';
                 statusHtml = `<span class="text-gray-500 font-semibold text-xs">Excluded</span>
                     <div class="text-[10px] text-gray-600 mt-0.5">Updates disabled</div>`;
@@ -350,7 +374,7 @@
                     class="text-gray-600 hover:text-red-400 text-xs transition">Uninstall</button>`;
             }
 
-            const exclCheckbox = isSelf
+            const exclCheckbox = (isSelf || isBundled)
                 ? '<span class="text-gray-700 text-xs">—</span>'
                 : `<label class="inline-flex items-center justify-center cursor-pointer" title="Exclude this plugin from update checks and bulk updates">
                     <input type="checkbox" data-plugin-id="${esc(p.id)}" onchange="updaterToggleExclude(this)"
@@ -359,7 +383,7 @@
                 </label>`;
 
             const src = sources[p.id];
-            const nameHtml = src
+            const nameHtml = (src && src.url)
                 ? `<a href="${esc(src.url)}" target="_blank" rel="noopener"
                         class="text-sm text-white hover:text-accent hover:underline truncate inline-flex items-center gap-1"
                         title="${esc(src.repo)} · open on GitHub">${esc(p.name)}
@@ -557,16 +581,29 @@
         let html = '';
         for (const r of rows) {
             const installed = r.installed || installedSet.has(r.dirname);
-            const action = installed
-                ? '<span class="text-green-400 text-xs font-semibold">Installed</span>'
-                : `<button data-url="${esc(r.url)}" data-dirname="${esc(r.dirname)}" onclick="updaterInstall(this)"
+            const overridesBundled = !!r.overrides_bundled;
+            let action;
+            if (installed && overridesBundled) {
+                action = '<span class="text-sky-400 text-xs font-semibold" title="Ships with slopsmith core">Bundled</span>';
+            } else if (installed) {
+                action = '<span class="text-green-400 text-xs font-semibold">Installed</span>';
+            } else {
+                action = `<button data-url="${esc(r.url)}" data-dirname="${esc(r.dirname)}"
+                    data-overrides-bundled="${overridesBundled ? '1' : ''}" onclick="updaterInstall(this)"
                     class="bg-accent/20 hover:bg-accent/30 text-accent px-3 py-1 rounded-lg text-xs transition">Install</button>`;
+            }
+
+            const bundledBadge = overridesBundled
+                ? `<span class="text-[10px] text-sky-300 bg-sky-900/30 border border-sky-500/30 rounded px-1.5 py-0.5"
+                        title="A bundled copy of this plugin already ships with slopsmith. Installing this would override it.">Overrides bundled</span>`
+                : '';
 
             html += `<div class="flex items-start gap-3 bg-dark-700/40 rounded-lg px-4 py-3">
                 <div class="flex-1 min-w-0">
                     <div class="flex items-center gap-2 flex-wrap">
                         <a href="${esc(r.url)}" target="_blank" class="text-sm text-white hover:text-accent truncate">${esc(r.name)}</a>
                         <span class="text-[10px] text-gray-600 font-mono">${esc(r.repo)}</span>
+                        ${bundledBadge}
                     </div>
                     <div class="text-xs text-gray-500 mt-0.5">${esc(r.description)}</div>
                     <div class="text-[10px] text-gray-600 mt-1 font-mono">dir: ${esc(r.dirname)}</div>
@@ -580,6 +617,13 @@
     window.updaterInstall = async function (btn) {
         const url = btn.dataset.url;
         const dirname = btn.dataset.dirname;
+        if (btn.dataset.overridesBundled === '1') {
+            const ok = confirm(
+                'A bundled copy of "' + dirname + '" already ships with slopsmith.\n\n' +
+                'Installing this version will override the bundled copy. Continue?'
+            );
+            if (!ok) return;
+        }
         btn.disabled = true;
         btn.textContent = 'Installing...';
         try {
@@ -635,10 +679,10 @@
         statusEl.className = 'text-xs text-gray-400 mb-2';
         statusEl.textContent = 'Sending restart signal...';
 
-        try {
-            await fetch(API + '/restart', { method: 'POST' });
-        } catch (e) {
-            // Connection may drop as the process re-execs. Expected.
+        if (isDesktop) {
+            try { await window.slopsmithDesktop.plugins.restart(); } catch (e) { /* ignore */ }
+        } else {
+            try { await fetch(API + '/restart', { method: 'POST' }); } catch (e) { /* connection drop expected */ }
         }
 
         statusEl.textContent = 'Waiting for server to come back...';
@@ -670,7 +714,7 @@
             btn.textContent = origLabel;
             if (copyBtn) copyBtn.disabled = false;
             statusEl.className = 'text-xs text-red-400 mb-2';
-            statusEl.textContent = 'Restart timed out after 30s. Try docker compose restart and refresh the page.';
+            statusEl.textContent = 'Server did not respond within 30s. Try restarting the app.';
         }
     };
 

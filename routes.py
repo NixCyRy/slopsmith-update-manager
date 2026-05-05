@@ -148,6 +148,24 @@ def _installed_plugin_dirs() -> dict[str, Path]:
     return out
 
 
+def _is_bundled(plugin_dir: Path) -> bool:
+    """Return True if the plugin's manifest declares `bundled: true`.
+
+    Bundled plugins ship in-tree with the slopsmith container image
+    (slopsmith#160). They aren't `git clone`-installed and don't carry
+    a marker file or `.git/`. Updates and uninstalls are handled by
+    slopsmith core, not by this plugin.
+    """
+    manifest = plugin_dir / "plugin.json"
+    if not manifest.exists():
+        return False
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        return bool(isinstance(data, dict) and data.get("bundled") is True)
+    except Exception:
+        return False
+
+
 def _read_marker(plugin_dir: Path) -> dict | None:
     f = plugin_dir / MARKER
     if not f.exists():
@@ -467,10 +485,18 @@ def setup(app, context):
         except Exception as e:
             return {"error": f"Failed to fetch registry: {e}"}
         entries = _parse_registry(md)
-        installed_dirs = {p.name for p in _installed_plugin_dirs().values()}
+        installed = _installed_plugin_dirs()
+        installed_dirs = {p.name for p in installed.values()}
+        bundled_dirs = {p.name for p in installed.values() if _is_bundled(p)}
         for e in entries:
             e["installed"] = e["dirname"] in installed_dirs
-        return {"count": len(entries), "entries": entries}
+            # Surface dirname-collision with a bundled plugin so the UI
+            # can prompt before installing an override. Doesn't catch the
+            # case where the registry entry's install command targets a
+            # different directory than the bundled one — that requires
+            # an `upstream` annotation that isn't standardised yet.
+            e["overrides_bundled"] = e["dirname"] in bundled_dirs
+        return {"count": len(entries), "entries": entries, "bundled_dirs": sorted(bundled_dirs)}
 
     @app.post("/api/plugins/update_manager/install")
     async def install(body: dict):
@@ -509,8 +535,18 @@ def setup(app, context):
         results = {}
         errors = {}
         sources = {}
+        bundled = []
         excluded = _load_exclusions()
         for name, p in _installed_plugin_dirs().items():
+            if _is_bundled(p):
+                bundled.append(name)
+                # Bundled plugins are managed by slopsmith core: no marker,
+                # no .git/, no remote to compare against. Surface them in
+                # sources[] so the UI can render a "Bundled" badge instead
+                # of leaving them invisible — but skip the rest of the
+                # update-detection loop.
+                sources[name] = {"bundled": True}
+                continue
             info = _resolve_source(p)
             if info and info["owner"]:
                 sources[name] = {
@@ -551,7 +587,13 @@ def setup(app, context):
                     "source": info["source"],
                     "repo": f"{owner}/{repo}",
                 }
-        return {"updates": results, "errors": errors, "excluded": sorted(excluded), "sources": sources}
+        return {
+            "updates": results,
+            "errors": errors,
+            "excluded": sorted(excluded),
+            "sources": sources,
+            "bundled": sorted(bundled),
+        }
 
     @app.get("/api/plugins/update_manager/exclusions")
     def get_exclusions():
@@ -580,6 +622,11 @@ def setup(app, context):
         target = _installed_plugin_dirs().get(plugin_id)
         if not target or not target.is_dir():
             return {"error": "Plugin not found"}
+        if _is_bundled(target):
+            return {
+                "error": "Bundled with slopsmith core; updates ship with the slopsmith app itself.",
+                "bundled": True,
+            }
         info = _resolve_source(target)
         if not info:
             return {"error": "Plugin source unknown (no marker, no .git/config)"}
@@ -768,6 +815,11 @@ def setup(app, context):
         target = _installed_plugin_dirs().get(plugin_id)
         if not target or not target.is_dir():
             return {"error": "Plugin not found"}
+        if _is_bundled(target):
+            return {
+                "error": "Bundled with slopsmith core; cannot be uninstalled. Install a standalone copy under a different directory to override.",
+                "bundled": True,
+            }
         try:
             shutil.rmtree(target)
             return {"ok": True}
