@@ -23,6 +23,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+from fastapi import Request
+
 
 REGISTRY_URL = "https://raw.githubusercontent.com/byrongamatos/slopsmith/main/README.md"
 SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-]{0,63}$")
@@ -243,9 +245,129 @@ def _latest_sha(owner: str, repo: str, branch: str) -> str | None:
     return data.get("sha")
 
 
-def _download_and_replace(owner: str, repo: str, branch: str, target: Path, preserve_git: bool) -> None:
-    """Download repo zip and atomically replace `target` dir contents."""
-    url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
+def _read_local_version(plugin_dir: Path) -> str | None:
+    """Return the `version` field from a plugin's local plugin.json, or None."""
+    manifest = plugin_dir / "plugin.json"
+    if not manifest.exists():
+        return None
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        v = data.get("version") if isinstance(data, dict) else None
+        return v if isinstance(v, str) and v else None
+    except Exception:
+        return None
+
+
+def _fetch_remote_version(owner: str, repo: str, ref: str) -> str | None:
+    """Fetch plugin.json at `ref` (branch / tag / sha) and return its version, or None.
+
+    Uses raw.githubusercontent.com which serves blobs at any ref name and
+    is rate-limited far less aggressively than api.github.com.
+    """
+    if not ref:
+        return None
+    url = f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/plugin.json"
+    try:
+        body = _http_get(url, timeout=15).decode("utf-8")
+        data = json.loads(body)
+        v = data.get("version") if isinstance(data, dict) else None
+        return v if isinstance(v, str) and v else None
+    except Exception:
+        return None
+
+
+def _list_versions(owner: str, repo: str, branch: str, limit: int = 30) -> list[dict]:
+    """Return available versions for a plugin, ordered newest-first.
+
+    Each entry: {ref, sha, version, source} where:
+      - `ref` is the GitHub-resolvable identifier (refs/tags/X, sha, or branch)
+      - `source` is "tag" (from git tags) or "history" (from plugin.json bump
+        commits on the default branch).
+
+    Tags are listed first; then plugin.json version-bump commits on the
+    branch supplement them so plugins that don't tag their releases still
+    expose their semver history. Stops after `limit` total entries to
+    keep within GitHub's unauthenticated rate limit.
+    """
+    versions: list[dict] = []
+    seen_versions: set[str] = set()
+
+    # 1. Git tags. One API call. We fetch each tag's plugin.json version
+    #    too so the UI can show "v1.5.0 (1.5.0)" for tags whose names
+    #    don't match the manifest version exactly.
+    try:
+        tags = _http_json(
+            f"https://api.github.com/repos/{owner}/{repo}/tags?per_page={limit}"
+        )
+        for t in tags:
+            sha = ((t or {}).get("commit") or {}).get("sha")
+            tag_name = (t or {}).get("name")
+            if not (sha and tag_name):
+                continue
+            v = _fetch_remote_version(owner, repo, f"refs/tags/{tag_name}")
+            entry = {
+                "ref": f"refs/tags/{tag_name}",
+                "sha": sha,
+                "version": v,
+                "source": "tag",
+                "label": tag_name,
+            }
+            versions.append(entry)
+            if v:
+                seen_versions.add(v)
+            if len(versions) >= limit:
+                return versions
+    except Exception:
+        pass
+
+    # 2. Scan plugin.json bump commits on the branch. One API call lists
+    #    all commits that touched plugin.json; for each, one extra fetch
+    #    reads the version. Cap to keep the worst-case unauthenticated
+    #    rate-limit cost bounded.
+    remaining = max(0, limit - len(versions))
+    if remaining <= 0:
+        return versions
+    try:
+        commits = _http_json(
+            f"https://api.github.com/repos/{owner}/{repo}/commits"
+            f"?path=plugin.json&sha={branch}&per_page={remaining}"
+        )
+        for c in commits:
+            sha = (c or {}).get("sha")
+            if not sha:
+                continue
+            v = _fetch_remote_version(owner, repo, sha)
+            if not v or v in seen_versions:
+                continue
+            seen_versions.add(v)
+            versions.append({
+                "ref": sha,
+                "sha": sha,
+                "version": v,
+                "source": "history",
+                "label": v,
+            })
+            if len(versions) >= limit:
+                break
+    except Exception:
+        pass
+
+    return versions
+
+
+def _download_and_replace(owner: str, repo: str, ref: str, target: Path, preserve_git: bool) -> None:
+    """Download repo zip at `ref` and atomically replace `target` dir contents.
+
+    `ref` is anything codeload.github.com accepts after the trailing slash
+    of `/zip/`: a branch path (`refs/heads/main`), a tag path
+    (`refs/tags/v1.0.0`), or a commit sha. The legacy callers passed
+    branch names without the `refs/heads/` prefix; preserve that
+    behaviour by prepending it when the caller didn't.
+    """
+    if not (ref.startswith("refs/") or len(ref) >= 7 and all(c in "0123456789abcdef" for c in ref.lower())):
+        # Bare branch name → expand to full ref so codeload finds it.
+        ref = f"refs/heads/{ref}"
+    url = f"https://codeload.github.com/{owner}/{repo}/zip/{ref}"
     data = _http_get(url, timeout=120)
     zf = zipfile.ZipFile(io.BytesIO(data))
     members = [m for m in zf.namelist() if not m.endswith("/")]
@@ -282,7 +404,8 @@ def _download_and_replace(owner: str, repo: str, branch: str, target: Path, pres
 
 
 def _resolve_source(plugin_dir: Path) -> dict | None:
-    """Return {'owner','repo','branch','local_sha','source'} or None."""
+    """Return {'owner','repo','branch','local_sha','local_version','source'} or None."""
+    local_version = _read_local_version(plugin_dir)
     marker = _read_marker(plugin_dir)
     if marker:
         owner, repo = _parse_repo_url(marker.get("url", ""))
@@ -291,6 +414,7 @@ def _resolve_source(plugin_dir: Path) -> dict | None:
                 "owner": owner, "repo": repo,
                 "branch": marker.get("branch"),
                 "local_sha": marker.get("sha"),
+                "local_version": local_version,
                 "source": "zip",
             }
     origin = _read_git_origin(plugin_dir)
@@ -302,9 +426,75 @@ def _resolve_source(plugin_dir: Path) -> dict | None:
                 "owner": owner, "repo": repo,
                 "branch": branch,
                 "local_sha": local_sha,
+                "local_version": local_version,
                 "source": "git",
             }
+    # Plugin has neither a marker nor a .git/ — typical for the bundled
+    # Electron desktop install where each plugin is a plain directory.
+    # Try two fallbacks before giving up:
+    #
+    #   a) plugin.json's optional `url` / `repository` field.
+    #   b) The Available Plugins registry in slopsmith's README, keyed by
+    #      directory name. This is what makes the bundled Electron case
+    #      work — the bundled install ships plain directories, but as
+    #      long as the directory name matches a registry entry we can
+    #      still resolve the upstream repo and detect updates.
+    manifest = plugin_dir / "plugin.json"
+    if manifest.exists():
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            url = data.get("url") or data.get("repository") or ""
+            if isinstance(url, str):
+                owner, repo = _parse_repo_url(url)
+                if owner:
+                    return {
+                        "owner": owner, "repo": repo,
+                        "branch": None,
+                        "local_sha": None,
+                        "local_version": local_version,
+                        "source": "manifest",
+                    }
+        except Exception:
+            pass
+    try:
+        for entry in _registry_cached():
+            if entry.get("dirname") == plugin_dir.name:
+                owner, repo = _parse_repo_url(entry.get("url") or "")
+                if owner:
+                    return {
+                        "owner": owner, "repo": repo,
+                        "branch": None,
+                        "local_sha": None,
+                        "local_version": local_version,
+                        "source": "registry",
+                    }
+    except Exception:
+        pass
     return None
+
+
+# Module-level registry cache. _registry_cached() refreshes the parsed
+# README at most every REGISTRY_TTL_S seconds, so the bundled-install
+# fallback in _resolve_source doesn't fetch the README on every request.
+_registry_cache: list[dict] = []
+_registry_cache_at: float = 0.0
+REGISTRY_TTL_S = 600  # 10 minutes
+
+
+def _registry_cached() -> list[dict]:
+    global _registry_cache, _registry_cache_at
+    now = time.time()
+    if _registry_cache and (now - _registry_cache_at) < REGISTRY_TTL_S:
+        return _registry_cache
+    try:
+        md = _http_get(REGISTRY_URL, timeout=10).decode("utf-8")
+        _registry_cache = _parse_registry(md)
+        _registry_cache_at = now
+    except Exception:
+        # Keep stale cache rather than nuke it on transient network errors;
+        # the cache will retry on the next call after TTL.
+        pass
+    return _registry_cache
 
 
 def _load_core_marker() -> dict | None:
@@ -416,19 +606,22 @@ def _overlay_core(stage: Path) -> list[str]:
     return written
 
 
-def _self_update(owner: str, repo: str, branch: str, sha: str) -> dict:
+def _self_update(owner: str, repo: str, ref: str, sha: str) -> dict:
     """Download new version to staging and mark for pending restart.
 
     Returns {"ok": true, "pending_restart": true} so the UI can prompt
     the user to restart. On restart, _apply_pending_self_update will
-    swap the files before re-execing the server.
+    swap the files before re-execing the server. `ref` accepts the same
+    forms as _download_and_replace (branch / refs/tags/X / sha).
     """
     staging = SELF_UPDATE_STAGING
     if staging.exists():
         shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True, exist_ok=True)
 
-    url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
+    if not (ref.startswith("refs/") or len(ref) >= 7 and all(c in "0123456789abcdef" for c in ref.lower())):
+        ref = f"refs/heads/{ref}"
+    url = f"https://codeload.github.com/{owner}/{repo}/zip/{ref}"
     data = _http_get(url, timeout=120)
     zf = zipfile.ZipFile(io.BytesIO(data))
     members = [m for m in zf.namelist() if not m.endswith("/")]
@@ -449,10 +642,10 @@ def _self_update(owner: str, repo: str, branch: str, sha: str) -> dict:
     marker = staging / ".self_update_pending"
     marker.write_text(json.dumps({
         "owner": owner, "repo": repo,
-        "branch": branch, "sha": sha,
+        "ref": ref, "sha": sha,
         "staged_at": int(time.time()),
     }, indent=2))
-    return {"ok": True, "pending_restart": True, "sha": sha[:7], "branch": branch}
+    return {"ok": True, "pending_restart": True, "sha": sha[:7], "ref": ref}
 
 
 def _apply_pending_self_update(target: Path) -> bool:
@@ -560,13 +753,19 @@ def setup(app, context):
                     "url": f"https://github.com/{info['owner']}/{info['repo']}",
                     "branch": info["branch"],
                     "source": info["source"],
+                    "local_version": info.get("local_version"),
                 }
             if name in excluded:
                 continue
-            if not info or not info["local_sha"]:
+            if not info:
                 continue
             owner, repo = info["owner"], info["repo"]
             branch = info["branch"] or _default_branch(owner, repo)
+            # We always need the remote tip to surface the remote version
+            # (and, when SHA tracking is available, to detect commit-level
+            # updates). For sources without a local SHA we still fetch it
+            # so the UI can show local_version → remote_version even on
+            # bundled / plain-dir installs.
             try:
                 remote_sha = _latest_sha(owner, repo, branch)
             except urllib.error.HTTPError as e:
@@ -585,10 +784,29 @@ def setup(app, context):
             except Exception as e:
                 errors[name] = {"code": "error", "message": str(e)}
                 continue
-            if remote_sha and remote_sha != info["local_sha"]:
+            remote_version = _fetch_remote_version(owner, repo, branch) if remote_sha else None
+            if remote_sha and name in sources:
+                sources[name]["remote_version"] = remote_version
+            local_version = info.get("local_version")
+            local_sha = info.get("local_sha")
+            # Two ways to detect "needs update":
+            #   (1) SHA-based: local_sha known, differs from remote_sha
+            #   (2) Version-fallback: no local_sha (e.g. bundled / plain
+            #       dir install) but local_version differs from remote_version
+            #
+            # Version-fallback is approximate — it can flag a "downgrade"
+            # if the local install is somehow ahead of the published
+            # remote — but for the bundled-install case it's the only
+            # signal we have. The UI surfaces version strings so the user
+            # can judge.
+            sha_update    = local_sha and remote_sha and remote_sha != local_sha
+            ver_update    = (not local_sha) and local_version and remote_version and remote_version != local_version
+            if sha_update or ver_update:
                 results[name] = {
-                    "local": info["local_sha"][:7],
-                    "remote": remote_sha[:7],
+                    "local": (local_sha or "")[:7],
+                    "remote": (remote_sha or "")[:7],
+                    "local_version": local_version,
+                    "remote_version": remote_version,
                     "branch": branch,
                     "source": info["source"],
                     "repo": f"{owner}/{repo}",
@@ -619,8 +837,49 @@ def setup(app, context):
         _save_exclusions(excl)
         return {"ok": True, "excluded": sorted(excl)}
 
+    @app.get("/api/plugins/update_manager/versions/{plugin_id}")
+    def list_plugin_versions(plugin_id: str):
+        """List available versions a plugin can be pinned to.
+
+        Surfaces git tags first (one API call), then plugin.json
+        version-bump commits scanned from the default branch (one
+        listing call + one fetch per commit, capped to keep within the
+        unauthenticated GitHub rate limit). The UI uses this for the
+        per-plugin "Versions" picker that supports both upgrade-to-
+        specific and downgrade-to-specific flows.
+        """
+        if not SLUG_RE.match(plugin_id):
+            return {"error": "Invalid plugin id"}
+        target = _installed_plugin_dirs().get(plugin_id)
+        if not target or not target.is_dir():
+            return {"error": "Plugin not found"}
+        if _is_bundled(target):
+            return {
+                "error": "Bundled with slopsmith core; version pinning not supported.",
+                "bundled": True,
+            }
+        info = _resolve_source(target)
+        if not info:
+            return {"error": "Plugin source unknown (no marker, no .git/config)"}
+        owner, repo = info["owner"], info["repo"]
+        branch = info["branch"] or _default_branch(owner, repo)
+        try:
+            entries = _list_versions(owner, repo, branch)
+            return {
+                "plugin_id": plugin_id,
+                "current_sha": info.get("local_sha"),
+                "current_version": info.get("local_version"),
+                "branch": branch,
+                "repo": f"{owner}/{repo}",
+                "versions": entries,
+            }
+        except urllib.error.HTTPError as e:
+            return {"error": f"HTTP {e.code}: {e.reason}"}
+        except Exception as e:
+            return {"error": str(e)}
+
     @app.post("/api/plugins/update_manager/update/{plugin_id}")
-    def apply_update(plugin_id: str):
+    async def apply_update(plugin_id: str, request: Request):
         if not SLUG_RE.match(plugin_id):
             return {"error": "Invalid plugin id"}
         if plugin_id in _load_exclusions():
@@ -636,17 +895,53 @@ def setup(app, context):
         info = _resolve_source(target)
         if not info:
             return {"error": "Plugin source unknown (no marker, no .git/config)"}
+        # Optional `ref` in the JSON body lets the caller pin to a
+        # specific tag or sha (upgrade or downgrade). Body parsing is
+        # tolerant: missing body, empty body, or no `ref` field all
+        # mean "update to latest on the tracked branch" — preserving
+        # backwards-compatible behaviour for the existing Update button.
+        ref = None
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                rv = body.get("ref")
+                if isinstance(rv, str) and rv.strip():
+                    ref = rv.strip()
+        except Exception:
+            pass
         owner, repo = info["owner"], info["repo"]
         branch = info["branch"] or _default_branch(owner, repo)
         try:
-            sha = _latest_sha(owner, repo, branch)
-            if not sha:
-                return {"error": "Could not resolve latest commit"}
+            if ref:
+                # User-provided ref. Resolve to a sha for the marker
+                # write. For tag refs (refs/tags/X) we hit the API to
+                # get the tagged commit's sha; for direct shas we
+                # accept the value as-is.
+                if ref.startswith("refs/tags/"):
+                    tag = ref[len("refs/tags/"):]
+                    try:
+                        tag_data = _http_json(
+                            f"https://api.github.com/repos/{owner}/{repo}/git/refs/tags/{tag}"
+                        )
+                        sha = ((tag_data or {}).get("object") or {}).get("sha")
+                    except Exception:
+                        sha = None
+                    if not sha:
+                        return {"error": f"Could not resolve tag {tag!r}"}
+                else:
+                    sha = ref
+                resolved_branch = branch  # remember tracked branch for the marker
+            else:
+                sha = _latest_sha(owner, repo, branch)
+                if not sha:
+                    return {"error": "Could not resolve latest commit"}
+                ref = branch
+                resolved_branch = branch
             if plugin_id == "update_manager":
-                return _self_update(owner, repo, branch, sha)
-            _download_and_replace(owner, repo, branch, target, preserve_git=(info["source"] == "git"))
-            _write_marker(target, owner, repo, branch, sha)
-            return {"ok": True, "sha": sha[:7], "branch": branch}
+                return _self_update(owner, repo, ref, sha)
+            _download_and_replace(owner, repo, ref, target, preserve_git=(info["source"] == "git"))
+            _write_marker(target, owner, repo, resolved_branch, sha)
+            return {"ok": True, "sha": sha[:7], "branch": resolved_branch, "ref": ref}
         except urllib.error.HTTPError as e:
             return {"error": f"HTTP {e.code}: {e.reason}"}
         except Exception as e:
