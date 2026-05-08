@@ -306,11 +306,11 @@
 
         let html = `<div class="grid grid-cols-[1fr_auto_auto_auto_auto_auto] gap-x-4 text-xs text-gray-500 font-semibold uppercase tracking-wider px-3 py-2 border-b border-gray-800">
             <span>Plugin</span>
-            <span class="w-24 text-center hidden sm:block">Local</span>
-            <span class="w-24 text-center hidden sm:block">Remote</span>
+            <span class="w-28 text-center hidden sm:block" title="Installed version (and short commit sha)">Local</span>
+            <span class="w-28 text-center hidden sm:block" title="Latest version on the tracked branch">Remote</span>
             <span class="w-28 text-center">Status</span>
             <span class="w-20 text-center" title="Exclude from automatic updates">Exclude</span>
-            <span class="w-40 text-center">Action</span>
+            <span class="w-44 text-center">Action</span>
         </div>`;
 
         for (const p of plugins) {
@@ -319,6 +319,11 @@
             const isExcluded = excluded.has(p.id);
             const isSelf = p.id === 'update_manager';
             const isBundled = bundledIds.has(p.id) || p.bundled === true;
+            const src = sources[p.id] || {};
+            const localVersion = u && u.local_version || src.local_version || '';
+            const remoteVersion = u && u.remote_version || src.remote_version || '';
+            const localShaShort = u && u.local || '';
+            const remoteShaShort = u && u.remote || '';
 
             let statusHtml, actionHtml, rowBg, localStr = '', remoteStr = '';
             if (isBundled) {
@@ -382,7 +387,6 @@
                         class="accent-amber-500 w-3.5 h-3.5 rounded">
                 </label>`;
 
-            const src = sources[p.id];
             const nameHtml = (src && src.url)
                 ? `<a href="${esc(src.url)}" target="_blank" rel="noopener"
                         class="text-sm text-white hover:text-accent hover:underline truncate inline-flex items-center gap-1"
@@ -391,20 +395,168 @@
                     </a>`
                 : `<div class="text-sm text-white truncate">${esc(p.name)}</div>`;
 
-            html += `<div class="grid grid-cols-[1fr_auto_auto_auto_auto_auto] gap-x-4 items-center px-3 py-2.5 rounded-lg ${rowBg} transition" data-row-id="${esc(p.id)}">
+            // Version pickers are useful for any plugin that the
+            // backend can resolve a remote source for — even up-to-date
+            // ones (downgrade flow). Hide for bundled plugins (managed
+            // by core) and for the update_manager itself if the user
+            // is mid-self-update flow (avoids surprise during pending
+            // restart). The button is plain text so it doesn't compete
+            // visually with the primary Update / Uninstall action.
+            const canPickVersion = !isBundled && !isExcluded && !!(src && src.url);
+            const versionsBtn = canPickVersion
+                ? `<button data-plugin-id="${esc(p.id)}" onclick="updaterShowVersions(this)"
+                        class="text-gray-500 hover:text-accent text-xs transition"
+                        title="Pin this plugin to a specific version (upgrade or downgrade)">Versions</button>`
+                : '';
+
+            const localCell = (localVersion || localShaShort)
+                ? `<div class="leading-tight">
+                        ${localVersion ? `<div class="text-gray-200 text-xs">${esc(localVersion)}</div>` : ''}
+                        ${localShaShort ? `<div class="text-gray-500 text-[10px] font-mono">${esc(localShaShort)}</div>` : ''}
+                    </div>`
+                : '<span class="text-gray-700 text-xs">—</span>';
+            const remoteCell = (remoteVersion || remoteShaShort)
+                ? `<div class="leading-tight">
+                        ${remoteVersion ? `<div class="text-gray-200 text-xs">${esc(remoteVersion)}</div>` : ''}
+                        ${remoteShaShort ? `<div class="text-gray-500 text-[10px] font-mono">${esc(remoteShaShort)}</div>` : ''}
+                    </div>`
+                : '<span class="text-gray-700 text-xs">—</span>';
+
+            html += `<div class="grid grid-cols-[1fr_auto_auto_auto_auto_auto] gap-x-4 items-center px-3 py-2.5 rounded-lg ${rowBg} transition relative" data-row-id="${esc(p.id)}">
                 <div class="min-w-0">
                     ${nameHtml}
                     <div class="text-xs text-gray-500 truncate">${esc(p.id)}</div>
                 </div>
-                <span class="w-24 text-center text-xs text-gray-400 font-mono hidden sm:block">${esc(localStr)}</span>
-                <span class="w-24 text-center text-xs text-gray-400 font-mono hidden sm:block">${esc(remoteStr)}</span>
+                <span class="w-28 text-center hidden sm:block">${localCell}</span>
+                <span class="w-28 text-center hidden sm:block">${remoteCell}</span>
                 <span class="w-28 text-center">${statusHtml}</span>
                 <span class="w-20 text-center">${exclCheckbox}</span>
-                <span class="w-40 text-center">${actionHtml}</span>
+                <span class="w-44 text-center">
+                    <div class="flex items-center justify-center gap-2">
+                        ${actionHtml}
+                        ${versionsBtn}
+                    </div>
+                </span>
             </div>`;
         }
         c.innerHTML = html;
     }
+
+    // ── Version picker (issue #5: pin to specific version) ─────────────
+    //
+    // A small popover anchored to the row's "Versions" button. Lazy-
+    // fetches /versions/{id} only when the user opens the picker, so
+    // the per-page Check-for-updates pass doesn't pay the rate-limit
+    // cost (one tags listing + N plugin.json fetches) for plugins the
+    // user never opens.
+    let _activeVersionPopover = null;
+    window.updaterShowVersions = async function (btn) {
+        // Toggle: clicking the same button again closes the popover.
+        if (_activeVersionPopover && _activeVersionPopover.dataset.pluginId === btn.dataset.pluginId) {
+            _activeVersionPopover.remove();
+            _activeVersionPopover = null;
+            return;
+        }
+        if (_activeVersionPopover) {
+            _activeVersionPopover.remove();
+            _activeVersionPopover = null;
+        }
+        const id = btn.dataset.pluginId;
+        const row = btn.closest('[data-row-id]');
+        if (!row) return;
+        const pop = document.createElement('div');
+        pop.dataset.pluginId = id;
+        pop.className = 'absolute right-3 top-full mt-1 z-50 bg-dark-800 border border-gray-700 rounded-lg shadow-xl text-xs w-72 max-h-72 overflow-y-auto';
+        pop.innerHTML = '<div class="px-3 py-2 text-gray-500">Loading versions…</div>';
+        row.appendChild(pop);
+        _activeVersionPopover = pop;
+        // Outside-click dismiss. Set up after a tick so the click that
+        // opened the popover doesn't immediately close it.
+        setTimeout(() => {
+            const off = (ev) => {
+                if (!pop.contains(ev.target) && ev.target !== btn) {
+                    pop.remove();
+                    if (_activeVersionPopover === pop) _activeVersionPopover = null;
+                    document.removeEventListener('click', off, true);
+                }
+            };
+            document.addEventListener('click', off, true);
+        }, 0);
+        try {
+            const r = await fetch(API + '/versions/' + encodeURIComponent(id));
+            const data = await r.json();
+            if (data.error) {
+                pop.innerHTML = `<div class="px-3 py-2 text-red-400">${esc(data.error)}</div>`;
+                return;
+            }
+            const versions = data.versions || [];
+            if (!versions.length) {
+                pop.innerHTML = `
+                    <div class="px-3 py-2 text-gray-400">
+                        No versioned releases found.
+                        <div class="text-[10px] text-gray-600 mt-1">
+                            This repo has no git tags and no plugin.json version-bump commits we can pin to.
+                            Use the regular <em>Update</em> button to track the latest commit on the branch.
+                        </div>
+                    </div>`;
+                return;
+            }
+            const currentSha = data.current_sha || '';
+            const currentVer = data.current_version || '';
+            const items = versions.map(v => {
+                const isCurrent = (v.sha && v.sha === currentSha) || (v.version && v.version === currentVer);
+                const verLabel = v.version || v.label || '(unknown)';
+                const tagBadge = v.source === 'tag'
+                    ? `<span class="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-sky-900/40 text-sky-300">tag ${esc(v.label)}</span>`
+                    : '';
+                const shaBadge = v.sha
+                    ? `<span class="ml-2 text-[10px] text-gray-500 font-mono">${esc(v.sha.slice(0, 7))}</span>`
+                    : '';
+                const currentBadge = isCurrent
+                    ? '<span class="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-green-900/40 text-green-300">current</span>'
+                    : '';
+                const click = isCurrent
+                    ? ''
+                    : `onclick="updaterUpdateAtRef('${esc(id)}', '${esc(v.ref)}', '${esc(verLabel)}')"`;
+                const interactive = isCurrent ? 'cursor-default text-gray-500' : 'cursor-pointer hover:bg-dark-700 text-gray-200';
+                return `<div ${click} class="px-3 py-2 ${interactive} border-b border-gray-800 last:border-b-0 flex items-center justify-between">
+                    <span class="truncate">${esc(verLabel)}${tagBadge}${currentBadge}</span>
+                    <span>${shaBadge}</span>
+                </div>`;
+            }).join('');
+            pop.innerHTML = `<div class="px-3 py-2 text-[10px] text-gray-500 border-b border-gray-800 sticky top-0 bg-dark-800">
+                    Pick a version (downgrade or upgrade)
+                </div>${items}`;
+        } catch (e) {
+            pop.innerHTML = `<div class="px-3 py-2 text-red-400">Failed: ${esc(e.message)}</div>`;
+        }
+    };
+
+    window.updaterUpdateAtRef = async function (id, ref, label) {
+        if (!confirm(`Switch ${id} to ${label}?\n\nThis replaces the plugin's files with the version at ref:\n  ${ref}\n\nA restart is required to pick up the change.`)) return;
+        if (_activeVersionPopover) {
+            _activeVersionPopover.remove();
+            _activeVersionPopover = null;
+        }
+        try {
+            const resp = await fetch(API + '/update/' + encodeURIComponent(id), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ref }),
+            });
+            const data = await resp.json();
+            if (data.ok) {
+                localStorage.setItem(RESTART_KEY, '1');
+                document.getElementById('updater-restart-banner').classList.remove('hidden');
+                // Re-check so the row reflects the new local sha/version.
+                if (typeof updaterCheck === 'function') updaterCheck();
+            } else {
+                alert('Failed to switch version: ' + (data.error || 'unknown error'));
+            }
+        } catch (e) {
+            alert('Failed to switch version: ' + e.message);
+        }
+    };
 
     window.updaterToggleExclude = async function (cb) {
         const id = cb.dataset.pluginId;

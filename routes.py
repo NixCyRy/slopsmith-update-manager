@@ -21,7 +21,10 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+from fastapi import Request
 
 
 REGISTRY_URL = "https://raw.githubusercontent.com/byrongamatos/slopsmith/main/README.md"
@@ -67,9 +70,50 @@ def _http_get(url: str, accept: str | None = None, timeout: int = 20) -> bytes:
     headers = {"User-Agent": UA}
     if accept:
         headers["Accept"] = accept
+    # Optional GitHub auth lifts the unauthenticated 60/hour IP rate
+    # limit to 5000/hour, which matters when a Check-for-updates pass
+    # over 30+ plugins plus a few /versions clicks would otherwise
+    # blow through the unauth budget. Sent only to api.github.com and
+    # raw.githubusercontent.com so we don't leak the token to other
+    # hosts (codeload.github.com doesn't need it for public repos).
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token and ("api.github.com" in url or "raw.githubusercontent.com" in url):
+        headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
+
+
+def _http_get_conditional(url: str, etag: str | None = None, accept: str | None = None, timeout: int = 20):
+    """Conditional GET with If-None-Match.
+
+    Returns (status, body_bytes_or_None, etag_or_None).
+    304 → status=304, body=None, etag preserved (caller should keep
+          the cached value but bump its TTL).
+    200 → status=200, body=fresh bytes, etag=new ETag from response.
+    Other → urllib raises (HTTPError for 4xx/5xx, OSError for network).
+
+    Conditional GETs against api.github.com that return 304 do NOT
+    count against the rate limit, so this is the primary mechanism
+    for staying inside the 60/hour anonymous budget while still
+    refreshing data on the long persistent-cache TTL.
+    """
+    headers = {"User-Agent": UA}
+    if accept:
+        headers["Accept"] = accept
+    if etag:
+        headers["If-None-Match"] = etag
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token and ("api.github.com" in url or "raw.githubusercontent.com" in url):
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read(), resp.headers.get("ETag")
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            return 304, None, e.headers.get("ETag") if e.headers else etag
+        raise
 
 
 def _http_json(url: str) -> dict:
@@ -243,9 +287,342 @@ def _latest_sha(owner: str, repo: str, branch: str) -> str | None:
     return data.get("sha")
 
 
-def _download_and_replace(owner: str, repo: str, branch: str, target: Path, preserve_git: bool) -> None:
-    """Download repo zip and atomically replace `target` dir contents."""
-    url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
+# Disk-persisted TTL cache for everything we fetch from GitHub.
+#
+# Without persistence, every container restart wipes the cache and the
+# next Check-for-updates pass spends ~one API call per plugin to refill
+# it — pointlessly burning rate-limit budget on data that almost never
+# changes minute-to-minute. Persisting under CACHE_DIR (which lives on
+# the rocksmith-config Docker volume) survives restarts; combined with
+# the long TTL, a typical user only ever fetches each remote SHA once
+# per session-day, even with frequent restarts.
+#
+# Stored as one JSON file with string keys so we don't have to
+# serialise tuples. Per-entry shape: { value, expires_at }. The cache
+# is loaded lazily on first read and rewritten on every put. Writes
+# are best-effort — a disk failure (read-only filesystem, no permission)
+# falls back to in-memory only.
+REMOTE_CACHE_FILE = CACHE_DIR / "remote_cache.json"
+_REMOTE_CACHE_TTL_S = 1800   # 30 minutes — longer than the old 5 min
+_VERSIONS_CACHE_TTL_S = 3600 # 1 hour — version-bump history rarely churns
+_remote_cache: dict | None = None
+_remote_cache_lock = threading.Lock()
+
+
+def _remote_cache_get_dict() -> dict:
+    global _remote_cache
+    if _remote_cache is not None:
+        return _remote_cache
+    with _remote_cache_lock:
+        if _remote_cache is not None:
+            return _remote_cache
+        loaded: dict = {}
+        if REMOTE_CACHE_FILE.exists():
+            try:
+                raw = json.loads(REMOTE_CACHE_FILE.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    loaded = raw
+            except Exception:
+                pass
+        _remote_cache = loaded
+        return _remote_cache
+
+
+def _remote_cache_save() -> None:
+    cache = _remote_cache
+    if cache is None:
+        return
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        REMOTE_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    except Exception:
+        # Disk-cache failure is non-fatal — the in-memory dict still
+        # works for the rest of this process's lifetime.
+        pass
+
+
+def _cache_entry(key: str) -> dict | None:
+    """Return the raw cache entry (value, etag, expires_at) or None.
+
+    Differs from _cache_get in that it returns the entry even when
+    expired — callers that do conditional refetch want the etag from
+    the stale entry to send If-None-Match.
+    """
+    cache = _remote_cache_get_dict()
+    entry = cache.get(key)
+    return entry if isinstance(entry, dict) else None
+
+
+def _cache_get(key: str):
+    """Return value if fresh; None if missing or expired."""
+    entry = _cache_entry(key)
+    if entry is None:
+        return None
+    if time.time() > entry.get("expires_at", 0):
+        return None
+    return entry.get("value")
+
+
+def _cache_put(key: str, value, etag: str | None = None, ttl_s: int = _REMOTE_CACHE_TTL_S) -> None:
+    cache = _remote_cache_get_dict()
+    cache[key] = {
+        "value": value,
+        "etag": etag,
+        "expires_at": time.time() + ttl_s,
+    }
+    _remote_cache_save()
+
+
+def _cache_refresh_ttl(key: str, ttl_s: int = _REMOTE_CACHE_TTL_S) -> None:
+    """Bump expires_at without changing value — used after a 304."""
+    cache = _remote_cache_get_dict()
+    entry = cache.get(key)
+    if isinstance(entry, dict):
+        entry["expires_at"] = time.time() + ttl_s
+        _remote_cache_save()
+
+
+def _conditional_fetch_json(url: str, key: str, ttl_s: int = _REMOTE_CACHE_TTL_S):
+    """Fetch JSON with persistent cache + conditional refresh.
+
+    Behaviour:
+      cache fresh → return cached value (no HTTP call)
+      cache stale → conditional GET with stored etag
+        304       → bump TTL, return cached value (no rate-limit cost)
+        200       → store fresh value + new etag, return new value
+        error     → on rate-limit (403/429), return stale value if any;
+                    otherwise re-raise so callers can surface the error.
+      cache miss  → unconditional GET, store result.
+    """
+    fresh = _cache_get(key)
+    if fresh is not None:
+        return fresh
+    stale = _cache_entry(key)  # may be expired
+    etag = stale.get("etag") if stale else None
+    try:
+        status, body, new_etag = _http_get_conditional(
+            url, etag=etag, accept="application/vnd.github+json"
+        )
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 429) and stale is not None:
+            # Rate-limited but we have stale data — serve it. The user
+            # would rather see slightly-out-of-date info than a dead UI.
+            _cache_refresh_ttl(key, ttl_s=60)  # short re-arm so we retry soon
+            return stale.get("value")
+        raise
+    if status == 304 and stale is not None:
+        _cache_refresh_ttl(key, ttl_s=ttl_s)
+        return stale.get("value")
+    if status == 200 and body is not None:
+        try:
+            value = json.loads(body.decode("utf-8"))
+        except Exception:
+            value = None
+        _cache_put(key, value, etag=new_etag, ttl_s=ttl_s)
+        return value
+    return None
+
+
+def _conditional_fetch_text(url: str, key: str, ttl_s: int = _REMOTE_CACHE_TTL_S) -> str | None:
+    """Like _conditional_fetch_json, but returns the raw text body.
+
+    Used for raw.githubusercontent.com payloads where we want to
+    parse a particular field (plugin.json's `version`) outside the
+    cache layer.
+    """
+    fresh = _cache_get(key)
+    if fresh is not None:
+        return fresh
+    stale = _cache_entry(key)
+    etag = stale.get("etag") if stale else None
+    try:
+        status, body, new_etag = _http_get_conditional(url, etag=etag)
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 429) and stale is not None:
+            _cache_refresh_ttl(key, ttl_s=60)
+            return stale.get("value")
+        raise
+    if status == 304 and stale is not None:
+        _cache_refresh_ttl(key, ttl_s=ttl_s)
+        return stale.get("value")
+    if status == 200 and body is not None:
+        try:
+            text = body.decode("utf-8")
+        except Exception:
+            text = None
+        _cache_put(key, text, etag=new_etag, ttl_s=ttl_s)
+        return text
+    return None
+
+
+def _latest_sha_cached(owner: str, repo: str, branch: str) -> str | None:
+    key = f"sha:{owner}/{repo}@{branch}"
+    data = _conditional_fetch_json(
+        f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}",
+        key=key,
+    )
+    if isinstance(data, dict):
+        return data.get("sha")
+    return None
+
+
+def _read_local_version(plugin_dir: Path) -> str | None:
+    """Return the `version` field from a plugin's local plugin.json, or None."""
+    manifest = plugin_dir / "plugin.json"
+    if not manifest.exists():
+        return None
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        v = data.get("version") if isinstance(data, dict) else None
+        return v if isinstance(v, str) and v else None
+    except Exception:
+        return None
+
+
+def _fetch_remote_version(owner: str, repo: str, ref: str) -> str | None:
+    """Fetch plugin.json at `ref` (branch / tag / sha) and return its version, or None.
+
+    Uses raw.githubusercontent.com via the conditional-fetch helper so
+    refreshes after the cache TTL are free under GitHub's rate limit
+    (304 responses to If-None-Match don't count). On rate-limit hits
+    we serve stale data rather than failing the call — the version
+    field rarely changes minute-to-minute.
+    """
+    if not ref:
+        return None
+    key = f"version:{owner}/{repo}@{ref}"
+    try:
+        text = _conditional_fetch_text(
+            f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/plugin.json",
+            key=key,
+        )
+    except Exception:
+        return None
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        v = data.get("version") if isinstance(data, dict) else None
+        return v if isinstance(v, str) and v else None
+    except Exception:
+        return None
+
+
+def _list_versions(owner: str, repo: str, branch: str, limit: int = 30) -> list[dict]:
+    """Return available versions for a plugin, ordered newest-first.
+
+    Each entry: {ref, sha, version, source} where:
+      - `ref` is the GitHub-resolvable identifier (refs/tags/X, sha, or branch)
+      - `source` is "tag" (from git tags) or "history" (from plugin.json bump
+        commits on the default branch).
+
+    Tags are listed first; then plugin.json version-bump commits on the
+    branch supplement them so plugins that don't tag their releases still
+    expose their semver history. Stops after `limit` total entries to
+    keep within GitHub's unauthenticated rate limit.
+    """
+    cache_key = f"versions:{owner}/{repo}@{branch}:{limit}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    versions: list[dict] = []
+    seen_versions: set[str] = set()
+    rate_limited = False
+
+    def _is_rate_limit(err: BaseException) -> bool:
+        return isinstance(err, urllib.error.HTTPError) and err.code in (403, 429)
+
+    # 1. Git tags. One API call (cached + conditional via ETag, so
+    #    refreshes after TTL are free under the rate limit).
+    try:
+        tags = _conditional_fetch_json(
+            f"https://api.github.com/repos/{owner}/{repo}/tags?per_page={limit}",
+            key=f"tags:{owner}/{repo}",
+            ttl_s=_VERSIONS_CACHE_TTL_S,
+        )
+        for t in (tags or []):
+            sha = ((t or {}).get("commit") or {}).get("sha")
+            tag_name = (t or {}).get("name")
+            if not (sha and tag_name):
+                continue
+            v = _fetch_remote_version(owner, repo, f"refs/tags/{tag_name}")
+            entry = {
+                "ref": f"refs/tags/{tag_name}",
+                "sha": sha,
+                "version": v,
+                "source": "tag",
+                "label": tag_name,
+            }
+            versions.append(entry)
+            if v:
+                seen_versions.add(v)
+            if len(versions) >= limit:
+                _cache_put(cache_key, versions, ttl_s=_VERSIONS_CACHE_TTL_S)
+                return versions
+    except Exception as e:
+        if _is_rate_limit(e):
+            rate_limited = True
+
+    # 2. Scan plugin.json bump commits on the branch. One API call lists
+    #    all commits that touched plugin.json; for each, one extra fetch
+    #    reads the version. Cap to keep the worst-case unauthenticated
+    #    rate-limit cost bounded.
+    remaining = max(0, limit - len(versions))
+    if remaining <= 0:
+        _cache_put(cache_key, versions, ttl_s=_VERSIONS_CACHE_TTL_S)
+        return versions
+    try:
+        commits = _conditional_fetch_json(
+            f"https://api.github.com/repos/{owner}/{repo}/commits"
+            f"?path=plugin.json&sha={branch}&per_page={remaining}",
+            key=f"plugincommits:{owner}/{repo}@{branch}:{remaining}",
+            ttl_s=_VERSIONS_CACHE_TTL_S,
+        )
+        for c in (commits or []):
+            sha = (c or {}).get("sha")
+            if not sha:
+                continue
+            v = _fetch_remote_version(owner, repo, sha)
+            if not v or v in seen_versions:
+                continue
+            seen_versions.add(v)
+            versions.append({
+                "ref": sha,
+                "sha": sha,
+                "version": v,
+                "source": "history",
+                "label": v,
+            })
+            if len(versions) >= limit:
+                break
+    except Exception as e:
+        if _is_rate_limit(e):
+            rate_limited = True
+
+    if rate_limited and not versions:
+        # Distinguish "no versioned releases exist" from "GitHub
+        # rate-limited us" — the UI shows different copy for each.
+        # Don't cache rate-limit failures so the next attempt can
+        # succeed once the limit resets.
+        raise RuntimeError("rate_limited")
+    _cache_put(cache_key, versions, ttl_s=_VERSIONS_CACHE_TTL_S)
+    return versions
+
+
+def _download_and_replace(owner: str, repo: str, ref: str, target: Path, preserve_git: bool) -> None:
+    """Download repo zip at `ref` and atomically replace `target` dir contents.
+
+    `ref` is anything codeload.github.com accepts after the trailing slash
+    of `/zip/`: a branch path (`refs/heads/main`), a tag path
+    (`refs/tags/v1.0.0`), or a commit sha. The legacy callers passed
+    branch names without the `refs/heads/` prefix; preserve that
+    behaviour by prepending it when the caller didn't.
+    """
+    if not (ref.startswith("refs/") or len(ref) >= 7 and all(c in "0123456789abcdef" for c in ref.lower())):
+        # Bare branch name → expand to full ref so codeload finds it.
+        ref = f"refs/heads/{ref}"
+    url = f"https://codeload.github.com/{owner}/{repo}/zip/{ref}"
     data = _http_get(url, timeout=120)
     zf = zipfile.ZipFile(io.BytesIO(data))
     members = [m for m in zf.namelist() if not m.endswith("/")]
@@ -282,7 +659,8 @@ def _download_and_replace(owner: str, repo: str, branch: str, target: Path, pres
 
 
 def _resolve_source(plugin_dir: Path) -> dict | None:
-    """Return {'owner','repo','branch','local_sha','source'} or None."""
+    """Return {'owner','repo','branch','local_sha','local_version','source'} or None."""
+    local_version = _read_local_version(plugin_dir)
     marker = _read_marker(plugin_dir)
     if marker:
         owner, repo = _parse_repo_url(marker.get("url", ""))
@@ -291,6 +669,7 @@ def _resolve_source(plugin_dir: Path) -> dict | None:
                 "owner": owner, "repo": repo,
                 "branch": marker.get("branch"),
                 "local_sha": marker.get("sha"),
+                "local_version": local_version,
                 "source": "zip",
             }
     origin = _read_git_origin(plugin_dir)
@@ -302,9 +681,68 @@ def _resolve_source(plugin_dir: Path) -> dict | None:
                 "owner": owner, "repo": repo,
                 "branch": branch,
                 "local_sha": local_sha,
+                "local_version": local_version,
                 "source": "git",
             }
+    # Plugin has neither a marker nor a .git/ — typical for the bundled
+    # Electron desktop install where each plugin is a plain directory.
+    # Try two fallbacks before giving up:
+    #
+    #   a) plugin.json's optional `url` / `repository` field.
+    #   b) The Available Plugins registry in slopsmith's README, keyed by
+    #      directory name. This is what makes the bundled Electron case
+    #      work — the bundled install ships plain directories, but as
+    #      long as the directory name matches a registry entry we can
+    #      still resolve the upstream repo and detect updates.
+    manifest = plugin_dir / "plugin.json"
+    if manifest.exists():
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            url = data.get("url") or data.get("repository") or ""
+            if isinstance(url, str):
+                owner, repo = _parse_repo_url(url)
+                if owner:
+                    return {
+                        "owner": owner, "repo": repo,
+                        "branch": None,
+                        "local_sha": None,
+                        "local_version": local_version,
+                        "source": "manifest",
+                    }
+        except Exception:
+            pass
+    try:
+        for entry in _registry_cached():
+            if entry.get("dirname") == plugin_dir.name:
+                owner, repo = _parse_repo_url(entry.get("url") or "")
+                if owner:
+                    return {
+                        "owner": owner, "repo": repo,
+                        "branch": None,
+                        "local_sha": None,
+                        "local_version": local_version,
+                        "source": "registry",
+                    }
+    except Exception:
+        pass
     return None
+
+
+# Registry parsed from slopsmith's README. The raw README fetch goes
+# through _conditional_fetch_text so refreshes after TTL are free
+# (304 responses don't count against the rate limit). Parsing happens
+# every time we hit the cache because the parsed dict isn't itself
+# cached — but that's a few µs of regex work, dwarfed by network cost.
+def _registry_cached() -> list[dict]:
+    try:
+        md = _conditional_fetch_text(
+            REGISTRY_URL, key="registry:slopsmith-readme", ttl_s=_VERSIONS_CACHE_TTL_S,
+        )
+    except Exception:
+        md = None
+    if not md:
+        return []
+    return _parse_registry(md)
 
 
 def _load_core_marker() -> dict | None:
@@ -416,19 +854,22 @@ def _overlay_core(stage: Path) -> list[str]:
     return written
 
 
-def _self_update(owner: str, repo: str, branch: str, sha: str) -> dict:
+def _self_update(owner: str, repo: str, ref: str, sha: str) -> dict:
     """Download new version to staging and mark for pending restart.
 
     Returns {"ok": true, "pending_restart": true} so the UI can prompt
     the user to restart. On restart, _apply_pending_self_update will
-    swap the files before re-execing the server.
+    swap the files before re-execing the server. `ref` accepts the same
+    forms as _download_and_replace (branch / refs/tags/X / sha).
     """
     staging = SELF_UPDATE_STAGING
     if staging.exists():
         shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True, exist_ok=True)
 
-    url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
+    if not (ref.startswith("refs/") or len(ref) >= 7 and all(c in "0123456789abcdef" for c in ref.lower())):
+        ref = f"refs/heads/{ref}"
+    url = f"https://codeload.github.com/{owner}/{repo}/zip/{ref}"
     data = _http_get(url, timeout=120)
     zf = zipfile.ZipFile(io.BytesIO(data))
     members = [m for m in zf.namelist() if not m.endswith("/")]
@@ -449,10 +890,10 @@ def _self_update(owner: str, repo: str, branch: str, sha: str) -> dict:
     marker = staging / ".self_update_pending"
     marker.write_text(json.dumps({
         "owner": owner, "repo": repo,
-        "branch": branch, "sha": sha,
+        "ref": ref, "sha": sha,
         "staged_at": int(time.time()),
     }, indent=2))
-    return {"ok": True, "pending_restart": True, "sha": sha[:7], "branch": branch}
+    return {"ok": True, "pending_restart": True, "sha": sha[:7], "ref": ref}
 
 
 def _apply_pending_self_update(target: Path) -> bool:
@@ -543,14 +984,15 @@ def setup(app, context):
         sources = {}
         bundled = []
         excluded = _load_exclusions()
+
+        # Phase 1 (serial, fast): collect plugin metadata + decide which
+        # plugins need remote work. All disk reads, no network. Builds
+        # the `to_check` list of (name, owner, repo, branch, info) for
+        # phase 2 to fan out.
+        to_check: list[tuple] = []
         for name, p in _installed_plugin_dirs().items():
             if _is_bundled(p):
                 bundled.append(name)
-                # Bundled plugins are managed by slopsmith core: no marker,
-                # no .git/, no remote to compare against. Surface them in
-                # sources[] so the UI can render a "Bundled" badge instead
-                # of leaving them invisible — but skip the rest of the
-                # update-detection loop.
                 sources[name] = {"bundled": True}
                 continue
             info = _resolve_source(p)
@@ -560,39 +1002,130 @@ def setup(app, context):
                     "url": f"https://github.com/{info['owner']}/{info['repo']}",
                     "branch": info["branch"],
                     "source": info["source"],
+                    "local_version": info.get("local_version"),
                 }
             if name in excluded:
                 continue
-            if not info or not info["local_sha"]:
+            if not info:
                 continue
+            to_check.append((name, info))
+
+        # Phase 2 (parallel): per-plugin remote fetches. With 30+ plugins
+        # the serial cost was ~30 × ~200ms = 6s+ on a cold cache, which
+        # users felt as a slow Update Manager screen load. Threading
+        # works because the per-plugin work is I/O-bound (GitHub HTTP)
+        # and our cache helpers are thread-safe via the global lock.
+        # max_workers=10 balances throughput against API politeness.
+        #
+        # Per-plugin call order is **version-first** to keep the cold-pass
+        # cheap on api.github.com's 60/hour anonymous IP rate limit:
+        #
+        #   1. Fetch plugin.json's `version` from raw.githubusercontent.com
+        #      (separate, much higher rate limit — effectively free here).
+        #   2. If local_version matches remote_version and we already have
+        #      a local_sha, ASSUME up to date — skip the api.github.com
+        #      call entirely. The displayed remote_sha == local_sha by
+        #      definition in this branch.
+        #   3. Only fall back to api.github.com `/repos/.../commits/{branch}`
+        #      to fetch the actual remote sha when the version comparison
+        #      indicates a possible update or we lack a local_sha to
+        #      compare against.
+        #
+        # Trade-off: a plugin whose author commits new code without
+        # bumping `plugin.json` version is invisible to update detection.
+        # We accept that — the manifest version is the user-facing change
+        # indicator, and "Versions" picker exposes commit-level history
+        # if the user wants to dig deeper.
+        def _check_one(name: str, info: dict) -> tuple[str, dict | None, dict | None, dict]:
+            """Returns (name, result_entry_or_None, error_entry_or_None, source_updates)."""
             owner, repo = info["owner"], info["repo"]
             branch = info["branch"] or _default_branch(owner, repo)
-            try:
-                remote_sha = _latest_sha(owner, repo, branch)
-            except urllib.error.HTTPError as e:
-                if e.code == 422:
-                    errors[name] = {
-                        "code": "branch_not_on_remote",
-                        "branch": branch,
-                        "message": f"Local branch '{branch}' not on {owner}/{repo}",
-                    }
-                else:
-                    errors[name] = {
+            source_updates = {"branch": branch} if not info["branch"] else {}
+            local_sha = info.get("local_sha")
+            local_version = info.get("local_version")
+
+            # Step 1: cheap version probe via raw.githubusercontent.com.
+            # We only attempt it if we have a local_version to compare
+            # against; otherwise the result wouldn't help us short-circuit
+            # the api.github.com call below.
+            remote_version = None
+            if local_version:
+                try:
+                    remote_version = _fetch_remote_version(owner, repo, branch)
+                except Exception:
+                    remote_version = None
+            source_updates["remote_version"] = remote_version
+
+            # Step 2: decide if we need the api.github.com sha lookup.
+            # When local_version == remote_version and we already have a
+            # local_sha, the shas must match too (the manifest is
+            # version-identical with the remote, and any sha-changing
+            # commit would have bumped version) — display them as equal
+            # without burning a rate-limit slot on the api call.
+            versions_match = (
+                local_version
+                and remote_version
+                and local_version == remote_version
+            )
+            need_sha = not local_sha or not versions_match
+            remote_sha = None
+            if need_sha:
+                try:
+                    remote_sha = _latest_sha_cached(owner, repo, branch)
+                except urllib.error.HTTPError as e:
+                    if e.code == 422:
+                        return name, None, {
+                            "code": "branch_not_on_remote",
+                            "branch": branch,
+                            "message": f"Local branch '{branch}' not on {owner}/{repo}",
+                        }, source_updates
+                    return name, None, {
                         "code": "http",
                         "message": f"HTTP {e.code}: {e.reason}",
-                    }
-                continue
-            except Exception as e:
-                errors[name] = {"code": "error", "message": str(e)}
-                continue
-            if remote_sha and remote_sha != info["local_sha"]:
-                results[name] = {
-                    "local": info["local_sha"][:7],
-                    "remote": remote_sha[:7],
+                    }, source_updates
+                except Exception as e:
+                    return name, None, {"code": "error", "message": str(e)}, source_updates
+            else:
+                # Versions match + we have a local sha → declare them equal
+                # without spending an api.github.com call.
+                remote_sha = local_sha
+
+            # If we got here without a remote_version (because we had no
+            # local_version to short-circuit with), fetch it now. This
+            # matters for the version-fallback update detection below
+            # and for the UI "X → Y" display when local_sha is missing.
+            if remote_version is None and (need_sha and remote_sha):
+                try:
+                    remote_version = _fetch_remote_version(owner, repo, branch)
+                except Exception:
+                    remote_version = None
+                source_updates["remote_version"] = remote_version
+
+            sha_update = local_sha and remote_sha and remote_sha != local_sha
+            ver_update = (not local_sha) and local_version and remote_version and remote_version != local_version
+            if sha_update or ver_update:
+                return name, {
+                    "local": (local_sha or "")[:7],
+                    "remote": (remote_sha or "")[:7],
+                    "local_version": local_version,
+                    "remote_version": remote_version,
                     "branch": branch,
                     "source": info["source"],
                     "repo": f"{owner}/{repo}",
-                }
+                }, None, source_updates
+            return name, None, None, source_updates
+
+        if to_check:
+            with ThreadPoolExecutor(max_workers=min(10, len(to_check))) as ex:
+                futures = [ex.submit(_check_one, name, info) for name, info in to_check]
+                for f in as_completed(futures):
+                    name, result_entry, error_entry, source_updates = f.result()
+                    if name in sources:
+                        sources[name].update(source_updates)
+                    if result_entry is not None:
+                        results[name] = result_entry
+                    if error_entry is not None:
+                        errors[name] = error_entry
         return {
             "updates": results,
             "errors": errors,
@@ -619,8 +1152,55 @@ def setup(app, context):
         _save_exclusions(excl)
         return {"ok": True, "excluded": sorted(excl)}
 
+    @app.get("/api/plugins/update_manager/versions/{plugin_id}")
+    def list_plugin_versions(plugin_id: str):
+        """List available versions a plugin can be pinned to.
+
+        Surfaces git tags first (one API call), then plugin.json
+        version-bump commits scanned from the default branch (one
+        listing call + one fetch per commit, capped to keep within the
+        unauthenticated GitHub rate limit). The UI uses this for the
+        per-plugin "Versions" picker that supports both upgrade-to-
+        specific and downgrade-to-specific flows.
+        """
+        if not SLUG_RE.match(plugin_id):
+            return {"error": "Invalid plugin id"}
+        target = _installed_plugin_dirs().get(plugin_id)
+        if not target or not target.is_dir():
+            return {"error": "Plugin not found"}
+        if _is_bundled(target):
+            return {
+                "error": "Bundled with slopsmith core; version pinning not supported.",
+                "bundled": True,
+            }
+        info = _resolve_source(target)
+        if not info:
+            return {"error": "Plugin source unknown (no marker, no .git/config)"}
+        owner, repo = info["owner"], info["repo"]
+        branch = info["branch"] or _default_branch(owner, repo)
+        try:
+            entries = _list_versions(owner, repo, branch)
+            return {
+                "plugin_id": plugin_id,
+                "current_sha": info.get("local_sha"),
+                "current_version": info.get("local_version"),
+                "branch": branch,
+                "repo": f"{owner}/{repo}",
+                "versions": entries,
+            }
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429):
+                return {"error": "GitHub rate limit hit. Try again in a few minutes.", "rate_limited": True}
+            return {"error": f"HTTP {e.code}: {e.reason}"}
+        except RuntimeError as e:
+            if str(e) == "rate_limited":
+                return {"error": "GitHub rate limit hit. Try again in a few minutes.", "rate_limited": True}
+            return {"error": str(e)}
+        except Exception as e:
+            return {"error": str(e)}
+
     @app.post("/api/plugins/update_manager/update/{plugin_id}")
-    def apply_update(plugin_id: str):
+    async def apply_update(plugin_id: str, request: Request):
         if not SLUG_RE.match(plugin_id):
             return {"error": "Invalid plugin id"}
         if plugin_id in _load_exclusions():
@@ -636,17 +1216,53 @@ def setup(app, context):
         info = _resolve_source(target)
         if not info:
             return {"error": "Plugin source unknown (no marker, no .git/config)"}
+        # Optional `ref` in the JSON body lets the caller pin to a
+        # specific tag or sha (upgrade or downgrade). Body parsing is
+        # tolerant: missing body, empty body, or no `ref` field all
+        # mean "update to latest on the tracked branch" — preserving
+        # backwards-compatible behaviour for the existing Update button.
+        ref = None
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                rv = body.get("ref")
+                if isinstance(rv, str) and rv.strip():
+                    ref = rv.strip()
+        except Exception:
+            pass
         owner, repo = info["owner"], info["repo"]
         branch = info["branch"] or _default_branch(owner, repo)
         try:
-            sha = _latest_sha(owner, repo, branch)
-            if not sha:
-                return {"error": "Could not resolve latest commit"}
+            if ref:
+                # User-provided ref. Resolve to a sha for the marker
+                # write. For tag refs (refs/tags/X) we hit the API to
+                # get the tagged commit's sha; for direct shas we
+                # accept the value as-is.
+                if ref.startswith("refs/tags/"):
+                    tag = ref[len("refs/tags/"):]
+                    try:
+                        tag_data = _http_json(
+                            f"https://api.github.com/repos/{owner}/{repo}/git/refs/tags/{tag}"
+                        )
+                        sha = ((tag_data or {}).get("object") or {}).get("sha")
+                    except Exception:
+                        sha = None
+                    if not sha:
+                        return {"error": f"Could not resolve tag {tag!r}"}
+                else:
+                    sha = ref
+                resolved_branch = branch  # remember tracked branch for the marker
+            else:
+                sha = _latest_sha(owner, repo, branch)
+                if not sha:
+                    return {"error": "Could not resolve latest commit"}
+                ref = branch
+                resolved_branch = branch
             if plugin_id == "update_manager":
-                return _self_update(owner, repo, branch, sha)
-            _download_and_replace(owner, repo, branch, target, preserve_git=(info["source"] == "git"))
-            _write_marker(target, owner, repo, branch, sha)
-            return {"ok": True, "sha": sha[:7], "branch": branch}
+                return _self_update(owner, repo, ref, sha)
+            _download_and_replace(owner, repo, ref, target, preserve_git=(info["source"] == "git"))
+            _write_marker(target, owner, repo, resolved_branch, sha)
+            return {"ok": True, "sha": sha[:7], "branch": resolved_branch, "ref": ref}
         except urllib.error.HTTPError as e:
             return {"error": f"HTTP {e.code}: {e.reason}"}
         except Exception as e:
