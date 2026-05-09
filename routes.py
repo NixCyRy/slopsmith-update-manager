@@ -1434,12 +1434,16 @@ def setup(app, context):
             if plugin_id == "update_manager":
                 return _self_update(owner, repo, ref, sha)
             # preserve_git is gated on the **structural** presence of a
-            # .git/ directory, NOT on info["source"]. After freshness-
-            # based source selection in _resolve_source, a git-cloned
-            # plugin with a recently-rewritten marker returns
-            # source="zip" — using that here would drop the live .git/
-            # directory and lose the user's clone.
-            preserve_git = (target / ".git").is_dir()
+            # .git entry, NOT on info["source"]. After freshness-based
+            # source selection in _resolve_source, a git-cloned plugin
+            # with a recently-rewritten marker returns source="zip" —
+            # using that here would drop the live .git/ directory (or
+            # gitdir-file in the worktree / submodule case) and lose
+            # the user's clone. Mirror _download_and_replace's own
+            # check (`.exists()`) so worktrees and submodules — which
+            # store `.git` as a file containing `gitdir: …` rather
+            # than a directory — are also preserved.
+            preserve_git = (target / ".git").exists()
             _download_and_replace(owner, repo, ref, target, preserve_git=preserve_git)
             _write_marker(target, owner, repo, resolved_branch, sha)
             return {"ok": True, "sha": sha[:7], "branch": resolved_branch, "ref": ref}
