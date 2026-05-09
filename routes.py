@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -244,22 +245,38 @@ def _read_git_origin(plugin_dir: Path) -> str | None:
     return m.group(1) if m else None
 
 
-def _read_git_local_sha(plugin_dir: Path) -> tuple[str | None, str | None]:
-    """Return (sha, branch) for a `.git`-managed plugin dir, without git CLI."""
+def _read_git_local_sha(plugin_dir: Path) -> tuple[str | None, str | None, Path | None]:
+    """Return (sha, branch, sha_source) for a `.git`-managed plugin dir.
+
+    `sha_source` is the file the sha was actually read from — the loose
+    ref file, .git/packed-refs, or .git/HEAD (detached). Callers that
+    need to gauge "when was this sha last updated" (e.g. for freshness
+    comparisons) should stat this path rather than guessing at HEAD.
+
+    Branch names with slashes (e.g. `feature/foo`) are preserved
+    verbatim — the ref name is the bit after `refs/heads/`, kept whole.
+    """
     head = plugin_dir / ".git" / "HEAD"
     if not head.exists():
-        return None, None
+        return None, None, None
     try:
         h = head.read_text().strip()
     except Exception:
-        return None, None
+        return None, None, None
     if h.startswith("ref: "):
         ref_name = h[5:].strip()
-        branch = ref_name.split("/")[-1] if "/" in ref_name else ref_name
+        # Strip the leading category (refs/heads/, refs/tags/, ...) so
+        # the returned `branch` value is the user-facing name. Handles
+        # multi-slash branch names like `feature/foo` correctly.
+        branch = ref_name
+        for prefix in ("refs/heads/", "refs/tags/", "refs/remotes/"):
+            if branch.startswith(prefix):
+                branch = branch[len(prefix):]
+                break
         ref_path = plugin_dir / ".git" / ref_name
         if ref_path.exists():
             try:
-                return ref_path.read_text().strip(), branch
+                return ref_path.read_text().strip(), branch, ref_path
             except Exception:
                 pass
         packed = plugin_dir / ".git" / "packed-refs"
@@ -267,11 +284,12 @@ def _read_git_local_sha(plugin_dir: Path) -> tuple[str | None, str | None]:
             try:
                 for ln in packed.read_text().splitlines():
                     if ln.endswith(" " + ref_name):
-                        return ln.split()[0], branch
+                        return ln.split()[0], branch, packed
             except Exception:
                 pass
-        return None, branch
-    return h, None
+        return None, branch, None
+    # Detached HEAD — the sha is in HEAD itself.
+    return h, None, head
 
 
 def _default_branch(owner: str, repo: str) -> str:
@@ -297,8 +315,22 @@ def _default_branch(owner: str, repo: str) -> str:
     return "main"
 
 
+def _quote_ref(ref: str) -> str:
+    """URL-encode a git ref for use as a GitHub URL path segment.
+
+    Preserves the `refs/heads/` / `refs/tags/` / `refs/remotes/`
+    prefix structure but encodes the branch / tag name portion (which
+    may contain `/`, e.g. `feature/foo`). Without this, slash-named
+    branches get split into extra path segments and the request 404s.
+    """
+    for prefix in ("refs/heads/", "refs/tags/", "refs/remotes/"):
+        if ref.startswith(prefix):
+            return prefix + urllib.parse.quote(ref[len(prefix):], safe="")
+    return urllib.parse.quote(ref, safe="")
+
+
 def _latest_sha(owner: str, repo: str, branch: str) -> str | None:
-    data = _http_json(f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}")
+    data = _http_json(f"https://api.github.com/repos/{owner}/{repo}/commits/{_quote_ref(branch)}")
     return data.get("sha")
 
 
@@ -473,7 +505,7 @@ def _conditional_fetch_text(url: str, key: str, ttl_s: int = _REMOTE_CACHE_TTL_S
 def _latest_sha_cached(owner: str, repo: str, branch: str) -> str | None:
     key = f"sha:{owner}/{repo}@{branch}"
     data = _conditional_fetch_json(
-        f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}",
+        f"https://api.github.com/repos/{owner}/{repo}/commits/{_quote_ref(branch)}",
         key=key,
     )
     if isinstance(data, dict):
@@ -508,7 +540,7 @@ def _fetch_remote_version(owner: str, repo: str, ref: str) -> str | None:
     key = f"version:{owner}/{repo}@{ref}"
     try:
         text = _conditional_fetch_text(
-            f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/plugin.json",
+            f"https://raw.githubusercontent.com/{owner}/{repo}/{_quote_ref(ref)}/plugin.json",
             key=key,
         )
     except Exception:
@@ -637,7 +669,7 @@ def _download_and_replace(owner: str, repo: str, ref: str, target: Path, preserv
     if not (ref.startswith("refs/") or len(ref) >= 7 and all(c in "0123456789abcdef" for c in ref.lower())):
         # Bare branch name → expand to full ref so codeload finds it.
         ref = f"refs/heads/{ref}"
-    url = f"https://codeload.github.com/{owner}/{repo}/zip/{ref}"
+    url = f"https://codeload.github.com/{owner}/{repo}/zip/{_quote_ref(ref)}"
     data = _http_get(url, timeout=120)
     zf = zipfile.ZipFile(io.BytesIO(data))
     members = [m for m in zf.namelist() if not m.endswith("/")]
@@ -674,31 +706,107 @@ def _download_and_replace(owner: str, repo: str, ref: str, target: Path, preserv
 
 
 def _resolve_source(plugin_dir: Path) -> dict | None:
-    """Return {'owner','repo','branch','local_sha','local_version','source'} or None."""
+    """Return {'owner','repo','branch','local_sha','local_version','source'} or None.
+
+    When BOTH a marker and a .git/ exist (cloned plugin that was later
+    UI-zip-updated, or zip-installed plugin that was later git-cloned
+    on top), pick whichever has the more recent local provenance:
+
+      - marker freshness = `installed_at` in .slopsmith-installed.json
+        (falls back to the marker file's own mtime when `installed_at`
+        is missing or malformed)
+      - git freshness    = mtime of the actual file _read_git_local_sha
+        resolved the sha from. That's:
+          .git/refs/heads/<branch>   for loose-ref checkouts
+          .git/packed-refs           for repos using packed-refs
+          .git/HEAD                  for detached-HEAD checkouts
+        Using the actual sha-source file matters: `git pull` rewrites
+        whichever of these holds the branch tip, so its mtime is the
+        one that advances on a fetch.
+
+    This avoids two symmetric "stuck local_sha" failure modes:
+      - Without freshness: a `git pull` would advance HEAD past the
+        marker's sha, but the marker still wins → "Update available"
+        forever even after the user is on the latest commit.
+      - With naive "git always wins": a UI-triggered zip update
+        rewrites the marker but leaves .git/refs/heads/<branch> at
+        its old commit (preserve_git=True), so the git path would
+        report the stale sha.
+
+    Fall back to the existing single-source paths (and finally to
+    manifest / registry resolution) when only one or neither is
+    available.
+    """
     local_version = _read_local_version(plugin_dir)
     marker = _read_marker(plugin_dir)
+    git_origin = _read_git_origin(plugin_dir)
+
+    candidates: list[dict] = []
+
     if marker:
         owner, repo = _parse_repo_url(marker.get("url", ""))
         if owner:
-            return {
+            # Defensive parse — the marker file is on disk and could
+            # carry a corrupted / non-numeric `installed_at` from an
+            # older format or hand-edit. On any parse failure, fall
+            # back to the marker file's mtime so freshness ordering
+            # still works for the common "last write" semantics.
+            # Kept as float so sub-second resolution survives the
+            # `max()` tiebreak.
+            installed_at = marker.get("installed_at")
+            try:
+                marker_freshness: float = float(installed_at)
+            except (TypeError, ValueError):
+                try:
+                    marker_freshness = float((plugin_dir / MARKER).stat().st_mtime)
+                except Exception:
+                    marker_freshness = 0.0
+            candidates.append({
                 "owner": owner, "repo": repo,
                 "branch": marker.get("branch"),
                 "local_sha": marker.get("sha"),
                 "local_version": local_version,
                 "source": "zip",
-            }
-    origin = _read_git_origin(plugin_dir)
-    if origin:
-        owner, repo = _parse_repo_url(origin)
+                "_freshness": marker_freshness,
+            })
+
+    if git_origin:
+        owner, repo = _parse_repo_url(git_origin)
         if owner:
-            local_sha, branch = _read_git_local_sha(plugin_dir)
-            return {
+            local_sha, branch, sha_source = _read_git_local_sha(plugin_dir)
+            # Always append the candidate when origin parses, even if
+            # local_sha couldn't be read. Falling through here would
+            # leave the plugin "source unknown" and break update flows
+            # for repos with unusual gitdir layouts / transient ref
+            # corruption — the previous code path returned a git
+            # candidate with local_sha=None in that case and we
+            # preserve that.
+            git_freshness: float = 0.0
+            if sha_source is not None:
+                try:
+                    git_freshness = float(sha_source.stat().st_mtime)
+                except Exception:
+                    git_freshness = 0.0
+            # Stat the same file the sha was actually read from so
+            # the mtime tracks the last advance of THIS sha. That's
+            # .git/refs/heads/<branch> for loose refs (handles
+            # multi-slash names like feature/foo correctly),
+            # .git/packed-refs for packed refs (which IS the file
+            # `git pull` rewrites in that case — .git/HEAD wouldn't
+            # move when staying on the same branch), or .git/HEAD
+            # for detached-HEAD checkouts.
+            candidates.append({
                 "owner": owner, "repo": repo,
                 "branch": branch,
                 "local_sha": local_sha,
                 "local_version": local_version,
                 "source": "git",
-            }
+                "_freshness": git_freshness,
+            })
+
+    if candidates:
+        best = max(candidates, key=lambda c: c["_freshness"])
+        return {k: v for k, v in best.items() if k != "_freshness"}
     # Plugin has neither a marker nor a .git/ — typical for the bundled
     # Electron desktop install where each plugin is a plain directory.
     # Try two fallbacks before giving up:
@@ -927,7 +1035,7 @@ def _classify_core_changes(files: list[dict]) -> tuple[list[dict], list[dict]]:
 
 def _download_core_stage(branch: str) -> tuple[Path, str]:
     """Download the core repo zip, extract to a tempdir, return (stage_root, prefix)."""
-    url = f"https://codeload.github.com/{CORE_REPO_OWNER}/{CORE_REPO_NAME}/zip/refs/heads/{branch}"
+    url = f"https://codeload.github.com/{CORE_REPO_OWNER}/{CORE_REPO_NAME}/zip/{_quote_ref(f'refs/heads/{branch}')}"
     data = _http_get(url, timeout=180)
     zf = zipfile.ZipFile(io.BytesIO(data))
     members = [m for m in zf.namelist() if not m.endswith("/")]
@@ -988,7 +1096,7 @@ def _self_update(owner: str, repo: str, ref: str, sha: str) -> dict:
 
     if not (ref.startswith("refs/") or len(ref) >= 7 and all(c in "0123456789abcdef" for c in ref.lower())):
         ref = f"refs/heads/{ref}"
-    url = f"https://codeload.github.com/{owner}/{repo}/zip/{ref}"
+    url = f"https://codeload.github.com/{owner}/{repo}/zip/{_quote_ref(ref)}"
     data = _http_get(url, timeout=120)
     zf = zipfile.ZipFile(io.BytesIO(data))
     members = [m for m in zf.namelist() if not m.endswith("/")]
@@ -1316,7 +1424,7 @@ def setup(app, context):
                     tag = ref[len("refs/tags/"):]
                     try:
                         tag_data = _http_json(
-                            f"https://api.github.com/repos/{owner}/{repo}/git/refs/tags/{tag}"
+                            f"https://api.github.com/repos/{owner}/{repo}/git/refs/tags/{urllib.parse.quote(tag, safe='')}"
                         )
                         sha = ((tag_data or {}).get("object") or {}).get("sha")
                     except Exception:
@@ -1334,7 +1442,18 @@ def setup(app, context):
                 resolved_branch = branch
             if plugin_id == "update_manager":
                 return _self_update(owner, repo, ref, sha)
-            _download_and_replace(owner, repo, ref, target, preserve_git=(info["source"] == "git"))
+            # preserve_git is gated on the **structural** presence of a
+            # .git entry, NOT on info["source"]. After freshness-based
+            # source selection in _resolve_source, a git-cloned plugin
+            # with a recently-rewritten marker returns source="zip" —
+            # using that here would drop the live .git/ directory (or
+            # gitdir-file in the worktree / submodule case) and lose
+            # the user's clone. Mirror _download_and_replace's own
+            # check (`.exists()`) so worktrees and submodules — which
+            # store `.git` as a file containing `gitdir: …` rather
+            # than a directory — are also preserved.
+            preserve_git = (target / ".git").exists()
+            _download_and_replace(owner, repo, ref, target, preserve_git=preserve_git)
             _write_marker(target, owner, repo, resolved_branch, sha)
             return {"ok": True, "sha": sha[:7], "branch": resolved_branch, "ref": ref}
         except urllib.error.HTTPError as e:
