@@ -275,11 +275,26 @@ def _read_git_local_sha(plugin_dir: Path) -> tuple[str | None, str | None]:
 
 
 def _default_branch(owner: str, repo: str) -> str:
+    """Return the repo's default branch, ETag-cached.
+
+    Goes through _conditional_fetch_json so repeat resolutions for the
+    same (owner, repo) are free under GitHub's rate limit. Important
+    for the version-first optimisation in _check_one — branchless
+    plugins (manifest/registry sources) would otherwise burn one
+    api.github.com slot here before the cheap raw.githubusercontent
+    version probe gets a chance. With caching, that cost is paid once
+    per plugin per TTL window instead of every recheck.
+    """
     try:
-        data = _http_json(f"https://api.github.com/repos/{owner}/{repo}")
-        return data.get("default_branch") or "main"
+        data = _conditional_fetch_json(
+            f"https://api.github.com/repos/{owner}/{repo}",
+            key=f"default_branch:{owner}/{repo}",
+        )
     except Exception:
         return "main"
+    if isinstance(data, dict):
+        return data.get("default_branch") or "main"
+    return "main"
 
 
 def _latest_sha(owner: str, repo: str, branch: str) -> str | None:
@@ -728,6 +743,110 @@ def _resolve_source(plugin_dir: Path) -> dict | None:
     return None
 
 
+# Per-plugin call order is **version-first** to keep the cold-pass
+# cheap on api.github.com's 60/hour anonymous IP rate limit:
+#
+#   1. Fetch plugin.json's `version` from raw.githubusercontent.com
+#      (separate, much higher rate limit — effectively free here).
+#   2. If local_version matches remote_version and we already have
+#      a local_sha, ASSUME up to date — skip the api.github.com
+#      call entirely. The displayed remote_sha == local_sha by
+#      definition in this branch.
+#   3. Only fall back to api.github.com `/repos/.../commits/{branch}`
+#      to fetch the actual remote sha when the version comparison
+#      indicates a possible update or we lack a local_sha to
+#      compare against.
+#
+# Trade-off: a plugin whose author commits new code without
+# bumping `plugin.json` version is invisible to update detection.
+# We accept that — the manifest version is the user-facing change
+# indicator, and "Versions" picker exposes commit-level history
+# if the user wants to dig deeper.
+def _check_one(name: str, info: dict) -> tuple[str, dict | None, dict | None, dict]:
+    """Returns (name, result_entry_or_None, error_entry_or_None, source_updates).
+
+    Module-level so both the bulk `/updates` parallel pool and the
+    per-plugin `/check/{plugin_id}` endpoint can invoke it. `info` is the
+    output of `_resolve_source(plugin_dir)`.
+    """
+    owner, repo = info["owner"], info["repo"]
+    branch = info["branch"] or _default_branch(owner, repo)
+    source_updates = {"branch": branch} if not info["branch"] else {}
+    local_sha = info.get("local_sha")
+    local_version = info.get("local_version")
+
+    # Step 1: cheap version probe via raw.githubusercontent.com.
+    # We only attempt it if we have a local_version to compare
+    # against; otherwise the result wouldn't help us short-circuit
+    # the api.github.com call below.
+    remote_version = None
+    if local_version:
+        try:
+            remote_version = _fetch_remote_version(owner, repo, branch)
+        except Exception:
+            remote_version = None
+    source_updates["remote_version"] = remote_version
+
+    # Step 2: decide if we need the api.github.com sha lookup.
+    # When local_version == remote_version and we already have a
+    # local_sha, the shas must match too (the manifest is
+    # version-identical with the remote, and any sha-changing
+    # commit would have bumped version) — display them as equal
+    # without burning a rate-limit slot on the api call.
+    versions_match = (
+        local_version
+        and remote_version
+        and local_version == remote_version
+    )
+    need_sha = not local_sha or not versions_match
+    remote_sha = None
+    if need_sha:
+        try:
+            remote_sha = _latest_sha_cached(owner, repo, branch)
+        except urllib.error.HTTPError as e:
+            if e.code == 422:
+                return name, None, {
+                    "code": "branch_not_on_remote",
+                    "branch": branch,
+                    "message": f"Local branch '{branch}' not on {owner}/{repo}",
+                }, source_updates
+            return name, None, {
+                "code": "http",
+                "message": f"HTTP {e.code}: {e.reason}",
+            }, source_updates
+        except Exception as e:
+            return name, None, {"code": "error", "message": str(e)}, source_updates
+    else:
+        # Versions match + we have a local sha → declare them equal
+        # without spending an api.github.com call.
+        remote_sha = local_sha
+
+    # If we got here without a remote_version (because we had no
+    # local_version to short-circuit with), fetch it now. This
+    # matters for the version-fallback update detection below
+    # and for the UI "X → Y" display when local_sha is missing.
+    if remote_version is None and (need_sha and remote_sha):
+        try:
+            remote_version = _fetch_remote_version(owner, repo, branch)
+        except Exception:
+            remote_version = None
+        source_updates["remote_version"] = remote_version
+
+    sha_update = local_sha and remote_sha and remote_sha != local_sha
+    ver_update = (not local_sha) and local_version and remote_version and remote_version != local_version
+    if sha_update or ver_update:
+        return name, {
+            "local": (local_sha or "")[:7],
+            "remote": (remote_sha or "")[:7],
+            "local_version": local_version,
+            "remote_version": remote_version,
+            "branch": branch,
+            "source": info["source"],
+            "repo": f"{owner}/{repo}",
+        }, None, source_updates
+    return name, None, None, source_updates
+
+
 # Registry parsed from slopsmith's README. The raw README fetch goes
 # through _conditional_fetch_text so refreshes after TTL are free
 # (304 responses don't count against the rate limit). Parsing happens
@@ -1016,105 +1135,7 @@ def setup(app, context):
         # works because the per-plugin work is I/O-bound (GitHub HTTP)
         # and our cache helpers are thread-safe via the global lock.
         # max_workers=10 balances throughput against API politeness.
-        #
-        # Per-plugin call order is **version-first** to keep the cold-pass
-        # cheap on api.github.com's 60/hour anonymous IP rate limit:
-        #
-        #   1. Fetch plugin.json's `version` from raw.githubusercontent.com
-        #      (separate, much higher rate limit — effectively free here).
-        #   2. If local_version matches remote_version and we already have
-        #      a local_sha, ASSUME up to date — skip the api.github.com
-        #      call entirely. The displayed remote_sha == local_sha by
-        #      definition in this branch.
-        #   3. Only fall back to api.github.com `/repos/.../commits/{branch}`
-        #      to fetch the actual remote sha when the version comparison
-        #      indicates a possible update or we lack a local_sha to
-        #      compare against.
-        #
-        # Trade-off: a plugin whose author commits new code without
-        # bumping `plugin.json` version is invisible to update detection.
-        # We accept that — the manifest version is the user-facing change
-        # indicator, and "Versions" picker exposes commit-level history
-        # if the user wants to dig deeper.
-        def _check_one(name: str, info: dict) -> tuple[str, dict | None, dict | None, dict]:
-            """Returns (name, result_entry_or_None, error_entry_or_None, source_updates)."""
-            owner, repo = info["owner"], info["repo"]
-            branch = info["branch"] or _default_branch(owner, repo)
-            source_updates = {"branch": branch} if not info["branch"] else {}
-            local_sha = info.get("local_sha")
-            local_version = info.get("local_version")
-
-            # Step 1: cheap version probe via raw.githubusercontent.com.
-            # We only attempt it if we have a local_version to compare
-            # against; otherwise the result wouldn't help us short-circuit
-            # the api.github.com call below.
-            remote_version = None
-            if local_version:
-                try:
-                    remote_version = _fetch_remote_version(owner, repo, branch)
-                except Exception:
-                    remote_version = None
-            source_updates["remote_version"] = remote_version
-
-            # Step 2: decide if we need the api.github.com sha lookup.
-            # When local_version == remote_version and we already have a
-            # local_sha, the shas must match too (the manifest is
-            # version-identical with the remote, and any sha-changing
-            # commit would have bumped version) — display them as equal
-            # without burning a rate-limit slot on the api call.
-            versions_match = (
-                local_version
-                and remote_version
-                and local_version == remote_version
-            )
-            need_sha = not local_sha or not versions_match
-            remote_sha = None
-            if need_sha:
-                try:
-                    remote_sha = _latest_sha_cached(owner, repo, branch)
-                except urllib.error.HTTPError as e:
-                    if e.code == 422:
-                        return name, None, {
-                            "code": "branch_not_on_remote",
-                            "branch": branch,
-                            "message": f"Local branch '{branch}' not on {owner}/{repo}",
-                        }, source_updates
-                    return name, None, {
-                        "code": "http",
-                        "message": f"HTTP {e.code}: {e.reason}",
-                    }, source_updates
-                except Exception as e:
-                    return name, None, {"code": "error", "message": str(e)}, source_updates
-            else:
-                # Versions match + we have a local sha → declare them equal
-                # without spending an api.github.com call.
-                remote_sha = local_sha
-
-            # If we got here without a remote_version (because we had no
-            # local_version to short-circuit with), fetch it now. This
-            # matters for the version-fallback update detection below
-            # and for the UI "X → Y" display when local_sha is missing.
-            if remote_version is None and (need_sha and remote_sha):
-                try:
-                    remote_version = _fetch_remote_version(owner, repo, branch)
-                except Exception:
-                    remote_version = None
-                source_updates["remote_version"] = remote_version
-
-            sha_update = local_sha and remote_sha and remote_sha != local_sha
-            ver_update = (not local_sha) and local_version and remote_version and remote_version != local_version
-            if sha_update or ver_update:
-                return name, {
-                    "local": (local_sha or "")[:7],
-                    "remote": (remote_sha or "")[:7],
-                    "local_version": local_version,
-                    "remote_version": remote_version,
-                    "branch": branch,
-                    "source": info["source"],
-                    "repo": f"{owner}/{repo}",
-                }, None, source_updates
-            return name, None, None, source_updates
-
+        # Each future calls module-level _check_one().
         if to_check:
             with ThreadPoolExecutor(max_workers=min(10, len(to_check))) as ex:
                 futures = [ex.submit(_check_one, name, info) for name, info in to_check]
@@ -1132,6 +1153,59 @@ def setup(app, context):
             "excluded": sorted(excluded),
             "sources": sources,
             "bundled": sorted(bundled),
+        }
+
+    @app.get("/api/plugins/update_manager/check/{plugin_id}")
+    def check_one_plugin(plugin_id: str):
+        """Recheck a single plugin against GitHub on demand.
+
+        Mirrors one slice of the bulk `/updates` response so the frontend
+        can merge the result into its local `updates / errors / sources`
+        dicts without re-running the whole batch. Useful when the bulk
+        cold pass exhausted GitHub's anonymous IP rate limit and left
+        some rows in "Check failed" — the user can wait for the quota
+        window and retry just the failed ones.
+        """
+        if not SLUG_RE.match(plugin_id):
+            return {"error": "Invalid plugin id"}
+        dirs = _installed_plugin_dirs()
+        p = dirs.get(plugin_id)
+        if not p:
+            return {"error": "Plugin not found"}
+
+        excluded_set = _load_exclusions()
+        bundled = _is_bundled(p)
+
+        # Mirror Phase 1 (serial metadata) for this single plugin so the
+        # response shape lines up with bulk `/updates`'s per-plugin slice.
+        source: dict = {}
+        info = None
+        if bundled:
+            source = {"bundled": True}
+        else:
+            info = _resolve_source(p)
+            if info and info["owner"]:
+                source = {
+                    "repo": f"{info['owner']}/{info['repo']}",
+                    "url": f"https://github.com/{info['owner']}/{info['repo']}",
+                    "branch": info["branch"],
+                    "source": info["source"],
+                    "local_version": info.get("local_version"),
+                }
+
+        result_entry = None
+        error_entry = None
+        if not bundled and plugin_id not in excluded_set and info:
+            _, result_entry, error_entry, source_updates = _check_one(plugin_id, info)
+            source.update(source_updates)
+
+        return {
+            "plugin_id": plugin_id,
+            "update": result_entry,
+            "error": error_entry,
+            "source": source,
+            "excluded": plugin_id in excluded_set,
+            "bundled": bundled,
         }
 
     @app.get("/api/plugins/update_manager/exclusions")
