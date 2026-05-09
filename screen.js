@@ -14,6 +14,27 @@
     let coreStatus = null;   // API + '/core'
     let currentTab = 'updates';
     let isDesktop = !!window.slopsmithDesktop?.isDesktop;
+    let _inflightChecks = new Set(); // plugin ids with an in-flight per-row recheck
+
+    // Refresh the "N updates available" status text and Update-all
+    // button visibility from current state. Called after any flow that
+    // mutates `updates` / `excluded` / `coreStatus`. Centralised so the
+    // counter rules don't drift between bulk check, exclusion toggle,
+    // and per-row recheck.
+    function updaterRefreshStatusUI() {
+        const pluginCount = Object.keys(updates).length;
+        const coreBehind = !!(coreStatus && coreStatus.behind && !coreStatus.excluded);
+        const total = pluginCount + (coreBehind ? 1 : 0);
+        const statusEl = document.getElementById('updater-status');
+        if (statusEl) {
+            statusEl.textContent = total === 0
+                ? 'Everything up to date.'
+                : total + ' update' + (total > 1 ? 's' : '') + ' available';
+        }
+        const coreUpdatable = coreBehind && !coreStatus.rebuild_required;
+        const allBtn = document.getElementById('updater-update-all-btn');
+        if (allBtn) allBtn.classList.toggle('hidden', pluginCount === 0 && !coreUpdatable);
+    }
 
     // ── Screen show hook ───────────────────────────────────────────────
     const _origShowScreen = window.showScreen;
@@ -91,15 +112,7 @@
             updaterRenderUpdates();
             document.getElementById('updater-last-checked').textContent =
                 'Last checked: ' + new Date().toLocaleTimeString();
-            const pluginCount = Object.keys(updates).length;
-            const coreBehind = !!(coreStatus && coreStatus.behind && !coreStatus.excluded);
-            const total = pluginCount + (coreBehind ? 1 : 0);
-            status.textContent = total === 0
-                ? 'Everything up to date.'
-                : total + ' update' + (total > 1 ? 's' : '') + ' available';
-            const coreUpdatable = coreBehind && !coreStatus.rebuild_required;
-            document.getElementById('updater-update-all-btn')
-                .classList.toggle('hidden', pluginCount === 0 && !coreUpdatable);
+            updaterRefreshStatusUI();
         } catch (e) {
             status.textContent = 'Check failed: ' + e.message;
         } finally {
@@ -418,10 +431,12 @@
             // tooltip would be misleading. Excluded rows still get the
             // button so the user can sync state without a network call.
             const canRecheck = !isBundled && !!(src && src.url);
+            const checking = _inflightChecks.has(p.id);
             const checkBtn = canRecheck
                 ? `<button data-plugin-id="${esc(p.id)}" onclick="updaterCheckOne(this)"
-                        class="text-gray-500 hover:text-white text-xs transition"
-                        title="Re-check this plugin against GitHub now">Check</button>`
+                        ${checking ? 'disabled' : ''}
+                        class="text-gray-500 hover:text-white text-xs transition ${checking ? 'opacity-60 cursor-wait' : ''}"
+                        title="Re-check this plugin against GitHub now">${checking ? '…' : 'Check'}</button>`
                 : '';
 
             const localCell = (localVersion || localShaShort)
@@ -595,15 +610,7 @@
                     delete updateErrors[id];
                 }
                 updaterRenderUpdates();
-                const pluginCount = Object.keys(updates).length;
-                const coreBehind = !!(coreStatus && coreStatus.behind && !coreStatus.excluded);
-                const total = pluginCount + (coreBehind ? 1 : 0);
-                document.getElementById('updater-status').textContent = total === 0
-                    ? 'Everything up to date.'
-                    : total + ' update' + (total > 1 ? 's' : '') + ' available';
-                const coreUpdatable = coreBehind && !coreStatus.rebuild_required;
-                document.getElementById('updater-update-all-btn')
-                    .classList.toggle('hidden', pluginCount === 0 && !coreUpdatable);
+                updaterRefreshStatusUI();
             } else {
                 cb.checked = !shouldExclude;
                 cb.title = data.error || 'Failed';
@@ -629,18 +636,25 @@
     // state the bulk flow uses, then re-renders. Lets the user retry a
     // single failed row after the cold-pass burnt through the anonymous
     // GitHub rate-limit window.
+    //
+    // In-flight state is tracked by plugin id (not by DOM element) so
+    // updaterRenderUpdates() can render the new button in its disabled
+    // spinner state. This avoids mutating the original click target after
+    // a re-render has already replaced it.
+    let _checkOneError = null;
     window.updaterCheckOne = async function (btn) {
         const id = btn.dataset.pluginId;
-        const orig = btn.textContent;
-        btn.disabled = true;
-        btn.textContent = '…';
+        if (_inflightChecks.has(id)) return;
+        _inflightChecks.add(id);
+        updaterRenderUpdates();
         try {
             const resp = await fetch(API + '/check/' + encodeURIComponent(id));
             const data = await resp.json();
             if (data.error && !data.plugin_id) {
                 // Validation-level error (bad id, plugin not found).
-                btn.title = data.error;
-                btn.textContent = '!';
+                // Surface on the freshly-rendered button after we drop
+                // the in-flight flag below.
+                _checkOneError = { id, message: data.error };
                 return;
             }
             if (data.update) updates[id] = data.update; else delete updates[id];
@@ -656,26 +670,24 @@
             }
             if (data.excluded) excluded.add(id); else excluded.delete(id);
             if (data.bundled) bundledIds.add(id); else bundledIds.delete(id);
-
-            updaterRenderUpdates();
-
-            const pluginCount = Object.keys(updates).length;
-            const coreBehind = !!(coreStatus && coreStatus.behind && !coreStatus.excluded);
-            const total = pluginCount + (coreBehind ? 1 : 0);
-            document.getElementById('updater-status').textContent = total === 0
-                ? 'Everything up to date.'
-                : total + ' update' + (total > 1 ? 's' : '') + ' available';
-            const coreUpdatable = coreBehind && !coreStatus.rebuild_required;
-            document.getElementById('updater-update-all-btn')
-                .classList.toggle('hidden', pluginCount === 0 && !coreUpdatable);
         } catch (e) {
-            btn.title = e.message;
-            btn.textContent = '!';
+            _checkOneError = { id, message: e.message };
         } finally {
-            // Brief delay so the user sees the result indicator before the
-            // re-render replaces this button (re-render only runs on success
-            // path; on the error/validation path the button stays).
-            setTimeout(() => { btn.disabled = false; btn.textContent = orig; }, 600);
+            _inflightChecks.delete(id);
+            updaterRenderUpdates();
+            updaterRefreshStatusUI();
+            // Apply any deferred error indicator to the freshly-rendered
+            // button. Done after re-render so we mutate the live element,
+            // not a detached one.
+            if (_checkOneError && _checkOneError.id === id) {
+                const row = document.querySelector('[data-row-id="' + CSS.escape(id) + '"]');
+                const newBtn = row ? row.querySelector('button[onclick^="updaterCheckOne("]') : null;
+                if (newBtn) {
+                    newBtn.textContent = '!';
+                    newBtn.title = _checkOneError.message;
+                }
+                _checkOneError = null;
+            }
         }
     };
 
