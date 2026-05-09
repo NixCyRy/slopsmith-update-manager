@@ -742,14 +742,16 @@ def _resolve_source(plugin_dir: Path) -> dict | None:
             # older format or hand-edit. On any parse failure, fall
             # back to the marker file's mtime so freshness ordering
             # still works for the common "last write" semantics.
+            # Kept as float so sub-second resolution survives the
+            # `max()` tiebreak.
             installed_at = marker.get("installed_at")
             try:
-                marker_freshness = int(installed_at)
+                marker_freshness: float = float(installed_at)
             except (TypeError, ValueError):
                 try:
-                    marker_freshness = int((plugin_dir / MARKER).stat().st_mtime)
+                    marker_freshness = float((plugin_dir / MARKER).stat().st_mtime)
                 except Exception:
-                    marker_freshness = 0
+                    marker_freshness = 0.0
             candidates.append({
                 "owner": owner, "repo": repo,
                 "branch": marker.get("branch"),
@@ -763,29 +765,35 @@ def _resolve_source(plugin_dir: Path) -> dict | None:
         owner, repo = _parse_repo_url(git_origin)
         if owner:
             local_sha, branch, sha_source = _read_git_local_sha(plugin_dir)
-            if local_sha:
-                # Stat the same file the sha was actually read from so
-                # the mtime tracks the last advance of THIS sha. That's
-                # .git/refs/heads/<branch> for loose refs (handles
-                # multi-slash names like feature/foo correctly),
-                # .git/packed-refs for packed refs (which IS the file
-                # `git pull` rewrites in that case — .git/HEAD wouldn't
-                # move when staying on the same branch), or .git/HEAD
-                # for detached-HEAD checkouts.
-                git_freshness = 0
-                if sha_source is not None:
-                    try:
-                        git_freshness = int(sha_source.stat().st_mtime)
-                    except Exception:
-                        git_freshness = 0
-                candidates.append({
-                    "owner": owner, "repo": repo,
-                    "branch": branch,
-                    "local_sha": local_sha,
-                    "local_version": local_version,
-                    "source": "git",
-                    "_freshness": git_freshness,
-                })
+            # Always append the candidate when origin parses, even if
+            # local_sha couldn't be read. Falling through here would
+            # leave the plugin "source unknown" and break update flows
+            # for repos with unusual gitdir layouts / transient ref
+            # corruption — the previous code path returned a git
+            # candidate with local_sha=None in that case and we
+            # preserve that.
+            git_freshness: float = 0.0
+            if sha_source is not None:
+                try:
+                    git_freshness = float(sha_source.stat().st_mtime)
+                except Exception:
+                    git_freshness = 0.0
+            # Stat the same file the sha was actually read from so
+            # the mtime tracks the last advance of THIS sha. That's
+            # .git/refs/heads/<branch> for loose refs (handles
+            # multi-slash names like feature/foo correctly),
+            # .git/packed-refs for packed refs (which IS the file
+            # `git pull` rewrites in that case — .git/HEAD wouldn't
+            # move when staying on the same branch), or .git/HEAD
+            # for detached-HEAD checkouts.
+            candidates.append({
+                "owner": owner, "repo": repo,
+                "branch": branch,
+                "local_sha": local_sha,
+                "local_version": local_version,
+                "source": "git",
+                "_freshness": git_freshness,
+            })
 
     if candidates:
         best = max(candidates, key=lambda c: c["_freshness"])
