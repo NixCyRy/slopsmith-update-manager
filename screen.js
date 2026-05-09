@@ -409,6 +409,16 @@
                         title="Pin this plugin to a specific version (upgrade or downgrade)">Versions</button>`
                 : '';
 
+            // Per-row recheck. Useful after the bulk cold pass exhausts
+            // GitHub's anonymous rate limit and leaves some rows in
+            // "Check failed" — the user can retry one row at a time.
+            // Hidden for bundled plugins (managed by core, not GitHub).
+            const checkBtn = !isBundled
+                ? `<button data-plugin-id="${esc(p.id)}" onclick="updaterCheckOne(this)"
+                        class="text-gray-500 hover:text-white text-xs transition"
+                        title="Re-check this plugin against GitHub now">Check</button>`
+                : '';
+
             const localCell = (localVersion || localShaShort)
                 ? `<div class="leading-tight">
                         ${localVersion ? `<div class="text-gray-200 text-xs">${esc(localVersion)}</div>` : ''}
@@ -433,6 +443,7 @@
                 <span class="w-20 text-center">${exclCheckbox}</span>
                 <span class="w-44 text-center">
                     <div class="flex items-center justify-center gap-2">
+                        ${checkBtn}
                         ${actionHtml}
                         ${versionsBtn}
                     </div>
@@ -605,6 +616,58 @@
         return updaterDoUpdate(btn.dataset.pluginId, btn);
     };
 
+    // ── Re-check one plugin ────────────────────────────────────────────
+    //
+    // Surfaced as a per-row "Check" button alongside the primary action.
+    // Calls the per-plugin endpoint (cheap: one slot of bulk's parallel
+    // pool, ETag-cached) and merges the result back into the same shared
+    // state the bulk flow uses, then re-renders. Lets the user retry a
+    // single failed row after the cold-pass burnt through the anonymous
+    // GitHub rate-limit window.
+    window.updaterCheckOne = async function (btn) {
+        const id = btn.dataset.pluginId;
+        const orig = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '…';
+        try {
+            const resp = await fetch(API + '/check/' + encodeURIComponent(id));
+            const data = await resp.json();
+            if (data.error && !data.plugin_id) {
+                // Validation-level error (bad id, plugin not found).
+                btn.title = data.error;
+                btn.textContent = '!';
+                return;
+            }
+            if (data.update) updates[id] = data.update; else delete updates[id];
+            if (data.error)  updateErrors[id] = data.error; else delete updateErrors[id];
+            if (data.source && Object.keys(data.source).length) {
+                sources[id] = { ...(sources[id] || {}), ...data.source };
+            }
+            if (data.excluded) excluded.add(id); else excluded.delete(id);
+            if (data.bundled) bundledIds.add(id); else bundledIds.delete(id);
+
+            updaterRenderUpdates();
+
+            const pluginCount = Object.keys(updates).length;
+            const coreBehind = !!(coreStatus && coreStatus.behind && !coreStatus.excluded);
+            const total = pluginCount + (coreBehind ? 1 : 0);
+            document.getElementById('updater-status').textContent = total === 0
+                ? 'Everything up to date.'
+                : total + ' update' + (total > 1 ? 's' : '') + ' available';
+            const coreUpdatable = coreBehind && !coreStatus.rebuild_required;
+            document.getElementById('updater-update-all-btn')
+                .classList.toggle('hidden', pluginCount === 0 && !coreUpdatable);
+        } catch (e) {
+            btn.title = e.message;
+            btn.textContent = '!';
+        } finally {
+            // Brief delay so the user sees the result indicator before the
+            // re-render replaces this button (re-render only runs on success
+            // path; on the error/validation path the button stays).
+            setTimeout(() => { btn.disabled = false; btn.textContent = orig; }, 600);
+        }
+    };
+
     async function updaterDoUpdate(id, btn) {
         btn.disabled = true;
         const orig = btn.textContent;
@@ -652,7 +715,9 @@
         for (const id of Object.keys(updates)) {
             if (excluded.has(id)) continue;
             const row = document.querySelector('[data-row-id="' + CSS.escape(id) + '"]');
-            const btn = row ? row.querySelector('button[data-plugin-id]') : null;
+            // Match the Update button specifically — the row may also
+            // hold a "Check" button with data-plugin-id since v1.8.0.
+            const btn = row ? row.querySelector('button[onclick^="updaterUpdate("]') : null;
             if (!btn) continue;
             await updaterDoUpdate(id, btn);
         }

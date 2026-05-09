@@ -20,6 +20,9 @@ A plugin for [Slopsmith](https://github.com/byrongamatos/slopsmith) that install
 
 ## What's New
 
+### v1.8.0
+- **Per-plugin Check button** — each plugin row now has a "Check" button next to its primary action. Re-checks just that plugin against GitHub, useful when the bulk cold pass has burnt through GitHub's anonymous rate-limit window and left some rows in "Check failed". Backed by a new `GET /check/{plugin_id}` endpoint that reuses the same conditional-fetch / version-first short-circuit as the bulk pass.
+
 ### v1.5.0
 - **Ignore non-core files** — updates to documentation (`*.md`, `docs/`), tests (`tests/`), and Claude config (`.claude/`) no longer block core updates. These paths are silently skipped during both blocker detection and extraction.
 - **Self-update** — the Update Manager can now update itself. When an update is available, clicking Update downloads the new version to a staging area, then prompts you to restart to apply it.
@@ -97,6 +100,7 @@ All endpoints are namespaced under `/api/plugins/update_manager/`:
 |--------|-----------------------------|----------------------------------------------|
 | GET    | `/registry`                 | Parses slopsmith's README and returns the plugin list |
 | GET    | `/updates`                  | Compares installed plugins against GitHub    |
+| GET    | `/check/{plugin_id}`        | Re-checks one plugin (returns `{plugin_id, update, error, source, excluded, bundled}`) |
 | POST   | `/install`                  | Body `{url, dirname}` — installs from a GitHub repo |
 | POST   | `/update/{plugin_id}`       | Re-downloads latest source and swaps         |
 | POST   | `/uninstall/{plugin_id}`    | Removes the plugin directory                 |
