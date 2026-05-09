@@ -275,11 +275,26 @@ def _read_git_local_sha(plugin_dir: Path) -> tuple[str | None, str | None]:
 
 
 def _default_branch(owner: str, repo: str) -> str:
+    """Return the repo's default branch, ETag-cached.
+
+    Goes through _conditional_fetch_json so repeat resolutions for the
+    same (owner, repo) are free under GitHub's rate limit. Important
+    for the version-first optimisation in _check_one — branchless
+    plugins (manifest/registry sources) would otherwise burn one
+    api.github.com slot here before the cheap raw.githubusercontent
+    version probe gets a chance. With caching, that cost is paid once
+    per plugin per TTL window instead of every recheck.
+    """
     try:
-        data = _http_json(f"https://api.github.com/repos/{owner}/{repo}")
-        return data.get("default_branch") or "main"
+        data = _conditional_fetch_json(
+            f"https://api.github.com/repos/{owner}/{repo}",
+            key=f"default_branch:{owner}/{repo}",
+        )
     except Exception:
         return "main"
+    if isinstance(data, dict):
+        return data.get("default_branch") or "main"
+    return "main"
 
 
 def _latest_sha(owner: str, repo: str, branch: str) -> str | None:

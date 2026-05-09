@@ -432,11 +432,18 @@
             // button so the user can sync state without a network call.
             const canRecheck = !isBundled && !!(src && src.url);
             const checking = _inflightChecks.has(p.id);
+            // Excluded rows skip the GitHub round-trip on the backend
+            // and only re-sync local state — phrase the tooltip
+            // accordingly so users aren't promised a network call that
+            // won't happen.
+            const checkTitle = isExcluded
+                ? 'Re-sync excluded state from server'
+                : 'Re-check this plugin against GitHub now';
             const checkBtn = canRecheck
                 ? `<button data-plugin-id="${esc(p.id)}" onclick="updaterCheckOne(this)"
                         ${checking ? 'disabled' : ''}
                         class="text-gray-500 hover:text-white text-xs transition ${checking ? 'opacity-60 cursor-wait' : ''}"
-                        title="Re-check this plugin against GitHub now">${checking ? '…' : 'Check'}</button>`
+                        title="${esc(checkTitle)}">${checking ? '…' : 'Check'}</button>`
                 : '';
 
             const localCell = (localVersion || localShaShort)
