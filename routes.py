@@ -1425,7 +1425,14 @@ def setup(app, context):
                 resolved_branch = branch
             if plugin_id == "update_manager":
                 return _self_update(owner, repo, ref, sha)
-            _download_and_replace(owner, repo, ref, target, preserve_git=(info["source"] == "git"))
+            # preserve_git is gated on the **structural** presence of a
+            # .git/ directory, NOT on info["source"]. After freshness-
+            # based source selection in _resolve_source, a git-cloned
+            # plugin with a recently-rewritten marker returns
+            # source="zip" — using that here would drop the live .git/
+            # directory and lose the user's clone.
+            preserve_git = (target / ".git").is_dir()
+            _download_and_replace(owner, repo, ref, target, preserve_git=preserve_git)
             _write_marker(target, owner, repo, resolved_branch, sha)
             return {"ok": True, "sha": sha[:7], "branch": resolved_branch, "ref": ref}
         except urllib.error.HTTPError as e:
