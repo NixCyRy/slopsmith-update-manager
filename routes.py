@@ -35,6 +35,11 @@ GH_REPO_RE = re.compile(
 )
 MARKER = ".slopsmith-installed.json"
 UA = "slopsmith-update-manager/1.4"
+# Process start time, captured at module import. Exposed via the
+# /start_time endpoint so the frontend can detect external restarts
+# (e.g. `docker compose restart`) and clear the per-row pending-
+# restart UI it would otherwise leave stuck across the restart.
+_PROCESS_STARTED_AT = time.time()
 _env_plugins = os.environ.get("SLOPSMITH_PLUGINS_DIR", "").strip()
 IS_DESKTOP = bool(_env_plugins)
 PLUGINS_DIR = Path(_env_plugins) if _env_plugins else Path(__file__).resolve().parent.parent
@@ -1315,6 +1320,18 @@ def setup(app, context):
             "excluded": plugin_id in excluded_set,
             "bundled": bundled,
         }
+
+    @app.get("/api/plugins/update_manager/start_time")
+    def process_start_time():
+        """Return when this server process started.
+
+        Used by the frontend to detect restarts that happen outside
+        of the in-app "Restart now" flow (docker compose restart,
+        host-side process kill, …). When the frontend sees the
+        value change, it clears the per-row pending-restart UI that
+        would otherwise stick across the external restart.
+        """
+        return {"started_at": _PROCESS_STARTED_AT}
 
     @app.get("/api/plugins/update_manager/exclusions")
     def get_exclusions():
