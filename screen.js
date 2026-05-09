@@ -1,6 +1,7 @@
 /* Update Manager - install + update plugins and slopsmith core over GitHub */
 (function () {
     const RESTART_KEY = 'update_manager:restartPending';
+    const PENDING_IDS_KEY = 'update_manager:pendingRestartIds';
     const API = '/api/plugins/update_manager';
     const CORE_KEY = '__core__';
 
@@ -15,6 +16,33 @@
     let currentTab = 'updates';
     let isDesktop = !!window.slopsmithDesktop?.isDesktop;
     let _inflightChecks = new Set(); // plugin ids with an in-flight per-row recheck
+    // Plugin ids whose update was applied but still need a server
+    // restart to take effect. Persists across page reloads via
+    // PENDING_IDS_KEY so the row keeps the "Updated · restart to
+    // apply" status until the user actually restarts.
+    let _pendingRestart = new Set(loadPendingRestart());
+
+    function loadPendingRestart() {
+        try {
+            const raw = localStorage.getItem(PENDING_IDS_KEY);
+            if (!raw) return [];
+            const arr = JSON.parse(raw);
+            return Array.isArray(arr) ? arr.filter(x => typeof x === 'string') : [];
+        } catch (e) { return []; }
+    }
+    function savePendingRestart() {
+        try {
+            localStorage.setItem(PENDING_IDS_KEY, JSON.stringify([..._pendingRestart]));
+        } catch (e) { /* ignore */ }
+    }
+    function markPendingRestart(id) {
+        _pendingRestart.add(id);
+        savePendingRestart();
+    }
+    function clearPendingRestart() {
+        _pendingRestart.clear();
+        try { localStorage.removeItem(PENDING_IDS_KEY); } catch (e) { /* ignore */ }
+    }
 
     // Refresh the "N updates available" status text and Update-all
     // button visibility from current state. Called after any flow that
@@ -343,7 +371,18 @@
             const remoteShaShort = u && u.remote || '';
 
             let statusHtml, actionHtml, rowBg, localStr = '', remoteStr = '';
-            if (isBundled) {
+            const isPendingRestart = _pendingRestart.has(p.id);
+            if (isPendingRestart && !isBundled) {
+                // Update was applied but the new code isn't loaded
+                // until the user restarts. Override "Update available"
+                // (which the bulk endpoint may still report until the
+                // marker hits the GitHub cache) so the row reflects
+                // local reality immediately after the click.
+                rowBg = 'bg-dark-700/40';
+                statusHtml = `<span class="text-amber-400 font-semibold text-xs">Updated · restart to apply</span>
+                    <div class="text-[10px] text-gray-600 mt-0.5">Click “Restart now” above</div>`;
+                actionHtml = `<span class="text-gray-600 text-xs">—</span>`;
+            } else if (isBundled) {
                 rowBg = 'bg-dark-800/30';
                 statusHtml = `<span class="text-sky-400 font-semibold text-xs inline-flex items-center gap-1">
                         <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
@@ -715,15 +754,17 @@
             const resp = await fetch(API + '/update/' + encodeURIComponent(id), { method: 'POST' });
             const data = await resp.json();
             if (data.ok) {
-                if (data.pending_restart) {
-                    btn.outerHTML = '<span class="text-amber-400 text-xs font-semibold">Restart to apply</span>';
-                    localStorage.setItem(RESTART_KEY, '1');
-                    document.getElementById('updater-restart-banner').classList.remove('hidden');
-                    return true;
-                }
-                btn.outerHTML = '<span class="text-green-400 text-xs font-semibold">Updated</span>';
+                // Both branches need a restart to load the new code,
+                // so clear the row's stale "Update available" state and
+                // mark it pending-restart. Re-render flips Status to
+                // "Updated · restart to apply" immediately.
+                delete updates[id];
+                delete updateErrors[id];
+                markPendingRestart(id);
                 localStorage.setItem(RESTART_KEY, '1');
                 document.getElementById('updater-restart-banner').classList.remove('hidden');
+                updaterRenderUpdates();
+                updaterRefreshStatusUI();
                 return true;
             }
             btn.disabled = false;
@@ -957,6 +998,7 @@
 
         if (back) {
             localStorage.removeItem(RESTART_KEY);
+            clearPendingRestart();
             document.getElementById('updater-restart-banner').classList.add('hidden');
             const elapsed = Math.round((Date.now() - start) / 100) / 10;
             const s = document.getElementById('updater-status');
@@ -977,6 +1019,8 @@
     window.updaterDismissBanner = function () {
         document.getElementById('updater-restart-banner').classList.add('hidden');
         localStorage.removeItem(RESTART_KEY);
+        clearPendingRestart();
+        updaterRenderUpdates();
     };
 
     // ── Utility ────────────────────────────────────────────────────────
