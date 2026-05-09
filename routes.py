@@ -674,31 +674,77 @@ def _download_and_replace(owner: str, repo: str, ref: str, target: Path, preserv
 
 
 def _resolve_source(plugin_dir: Path) -> dict | None:
-    """Return {'owner','repo','branch','local_sha','local_version','source'} or None."""
+    """Return {'owner','repo','branch','local_sha','local_version','source'} or None.
+
+    When BOTH a marker and a .git/ exist (cloned plugin that was later
+    UI-zip-updated, or zip-installed plugin that was later git-cloned
+    on top), pick whichever has the more recent local provenance:
+
+      - marker freshness  = `installed_at` in .slopsmith-installed.json
+      - git freshness     = mtime of .git/refs/heads/<branch> (or HEAD)
+
+    This avoids two symmetric "stuck local_sha" failure modes:
+      - Without freshness: a `git pull` would advance HEAD past the
+        marker's sha, but the marker still wins → "Update available"
+        forever even after the user is on the latest commit.
+      - With naive "git always wins": a UI-triggered zip update
+        rewrites the marker but leaves .git/refs/heads/<branch> at
+        its old commit (preserve_git=True), so the git path would
+        report the stale sha.
+
+    Fall back to the existing single-source paths (and finally to
+    manifest / registry resolution) when only one or neither is
+    available.
+    """
     local_version = _read_local_version(plugin_dir)
     marker = _read_marker(plugin_dir)
+    git_origin = _read_git_origin(plugin_dir)
+
+    candidates: list[dict] = []
+
     if marker:
         owner, repo = _parse_repo_url(marker.get("url", ""))
         if owner:
-            return {
+            candidates.append({
                 "owner": owner, "repo": repo,
                 "branch": marker.get("branch"),
                 "local_sha": marker.get("sha"),
                 "local_version": local_version,
                 "source": "zip",
-            }
-    origin = _read_git_origin(plugin_dir)
-    if origin:
-        owner, repo = _parse_repo_url(origin)
+                "_freshness": int(marker.get("installed_at") or 0),
+            })
+
+    if git_origin:
+        owner, repo = _parse_repo_url(git_origin)
         if owner:
             local_sha, branch = _read_git_local_sha(plugin_dir)
-            return {
-                "owner": owner, "repo": repo,
-                "branch": branch,
-                "local_sha": local_sha,
-                "local_version": local_version,
-                "source": "git",
-            }
+            if local_sha:
+                # Pick the ref file we actually read the sha from so
+                # the mtime reflects the last fetch / commit on the
+                # branch. Falls back to HEAD when the ref file is
+                # missing (packed-refs case) — slightly less precise
+                # but still moves on `git pull`.
+                ref_path = plugin_dir / ".git" / "HEAD"
+                if branch:
+                    branch_ref = plugin_dir / ".git" / "refs" / "heads" / branch
+                    if branch_ref.exists():
+                        ref_path = branch_ref
+                try:
+                    git_freshness = int(ref_path.stat().st_mtime)
+                except Exception:
+                    git_freshness = 0
+                candidates.append({
+                    "owner": owner, "repo": repo,
+                    "branch": branch,
+                    "local_sha": local_sha,
+                    "local_version": local_version,
+                    "source": "git",
+                    "_freshness": git_freshness,
+                })
+
+    if candidates:
+        best = max(candidates, key=lambda c: c["_freshness"])
+        return {k: v for k, v in best.items() if k != "_freshness"}
     # Plugin has neither a marker nor a .git/ — typical for the bundled
     # Electron desktop install where each plugin is a plain directory.
     # Try two fallbacks before giving up:

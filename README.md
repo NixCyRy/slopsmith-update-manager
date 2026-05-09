@@ -20,6 +20,9 @@ A plugin for [Slopsmith](https://github.com/byrongamatos/slopsmith) that install
 
 ## What's New
 
+### v1.8.1
+- **Fix stuck "Update available" after `git pull`** — `_resolve_source` now picks the freshest of the marker (`installed_at`) and `.git/refs/heads/<branch>` (mtime) instead of unconditionally preferring the marker. Cloned plugins whose marker is older than the current `.git` HEAD (typical after `git pull`) no longer appear behind forever; UI-zip-updated cloned plugins still surface the marker since it gets a newer `installed_at` than the preserved `.git/`.
+
 ### v1.8.0
 - **Per-plugin Check button** — each plugin row now has a "Check" button next to its primary action. Re-checks just that plugin against GitHub, useful when the bulk cold pass has burnt through GitHub's anonymous rate-limit window and left some rows in "Check failed". Backed by a new `GET /check/{plugin_id}` endpoint that reuses the same conditional-fetch / version-first short-circuit as the bulk pass.
 
