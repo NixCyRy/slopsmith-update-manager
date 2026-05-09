@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -314,8 +315,22 @@ def _default_branch(owner: str, repo: str) -> str:
     return "main"
 
 
+def _quote_ref(ref: str) -> str:
+    """URL-encode a git ref for use as a GitHub URL path segment.
+
+    Preserves the `refs/heads/` / `refs/tags/` / `refs/remotes/`
+    prefix structure but encodes the branch / tag name portion (which
+    may contain `/`, e.g. `feature/foo`). Without this, slash-named
+    branches get split into extra path segments and the request 404s.
+    """
+    for prefix in ("refs/heads/", "refs/tags/", "refs/remotes/"):
+        if ref.startswith(prefix):
+            return prefix + urllib.parse.quote(ref[len(prefix):], safe="")
+    return urllib.parse.quote(ref, safe="")
+
+
 def _latest_sha(owner: str, repo: str, branch: str) -> str | None:
-    data = _http_json(f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}")
+    data = _http_json(f"https://api.github.com/repos/{owner}/{repo}/commits/{_quote_ref(branch)}")
     return data.get("sha")
 
 
@@ -490,7 +505,7 @@ def _conditional_fetch_text(url: str, key: str, ttl_s: int = _REMOTE_CACHE_TTL_S
 def _latest_sha_cached(owner: str, repo: str, branch: str) -> str | None:
     key = f"sha:{owner}/{repo}@{branch}"
     data = _conditional_fetch_json(
-        f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}",
+        f"https://api.github.com/repos/{owner}/{repo}/commits/{_quote_ref(branch)}",
         key=key,
     )
     if isinstance(data, dict):
@@ -525,7 +540,7 @@ def _fetch_remote_version(owner: str, repo: str, ref: str) -> str | None:
     key = f"version:{owner}/{repo}@{ref}"
     try:
         text = _conditional_fetch_text(
-            f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/plugin.json",
+            f"https://raw.githubusercontent.com/{owner}/{repo}/{_quote_ref(ref)}/plugin.json",
             key=key,
         )
     except Exception:
@@ -654,7 +669,7 @@ def _download_and_replace(owner: str, repo: str, ref: str, target: Path, preserv
     if not (ref.startswith("refs/") or len(ref) >= 7 and all(c in "0123456789abcdef" for c in ref.lower())):
         # Bare branch name → expand to full ref so codeload finds it.
         ref = f"refs/heads/{ref}"
-    url = f"https://codeload.github.com/{owner}/{repo}/zip/{ref}"
+    url = f"https://codeload.github.com/{owner}/{repo}/zip/{_quote_ref(ref)}"
     data = _http_get(url, timeout=120)
     zf = zipfile.ZipFile(io.BytesIO(data))
     members = [m for m in zf.namelist() if not m.endswith("/")]
@@ -722,13 +737,26 @@ def _resolve_source(plugin_dir: Path) -> dict | None:
     if marker:
         owner, repo = _parse_repo_url(marker.get("url", ""))
         if owner:
+            # Defensive parse — the marker file is on disk and could
+            # carry a corrupted / non-numeric `installed_at` from an
+            # older format or hand-edit. On any parse failure, fall
+            # back to the marker file's mtime so freshness ordering
+            # still works for the common "last write" semantics.
+            installed_at = marker.get("installed_at")
+            try:
+                marker_freshness = int(installed_at)
+            except (TypeError, ValueError):
+                try:
+                    marker_freshness = int((plugin_dir / MARKER).stat().st_mtime)
+                except Exception:
+                    marker_freshness = 0
             candidates.append({
                 "owner": owner, "repo": repo,
                 "branch": marker.get("branch"),
                 "local_sha": marker.get("sha"),
                 "local_version": local_version,
                 "source": "zip",
-                "_freshness": int(marker.get("installed_at") or 0),
+                "_freshness": marker_freshness,
             })
 
     if git_origin:
@@ -990,7 +1018,7 @@ def _classify_core_changes(files: list[dict]) -> tuple[list[dict], list[dict]]:
 
 def _download_core_stage(branch: str) -> tuple[Path, str]:
     """Download the core repo zip, extract to a tempdir, return (stage_root, prefix)."""
-    url = f"https://codeload.github.com/{CORE_REPO_OWNER}/{CORE_REPO_NAME}/zip/refs/heads/{branch}"
+    url = f"https://codeload.github.com/{CORE_REPO_OWNER}/{CORE_REPO_NAME}/zip/{_quote_ref(f'refs/heads/{branch}')}"
     data = _http_get(url, timeout=180)
     zf = zipfile.ZipFile(io.BytesIO(data))
     members = [m for m in zf.namelist() if not m.endswith("/")]
@@ -1051,7 +1079,7 @@ def _self_update(owner: str, repo: str, ref: str, sha: str) -> dict:
 
     if not (ref.startswith("refs/") or len(ref) >= 7 and all(c in "0123456789abcdef" for c in ref.lower())):
         ref = f"refs/heads/{ref}"
-    url = f"https://codeload.github.com/{owner}/{repo}/zip/{ref}"
+    url = f"https://codeload.github.com/{owner}/{repo}/zip/{_quote_ref(ref)}"
     data = _http_get(url, timeout=120)
     zf = zipfile.ZipFile(io.BytesIO(data))
     members = [m for m in zf.namelist() if not m.endswith("/")]
@@ -1379,7 +1407,7 @@ def setup(app, context):
                     tag = ref[len("refs/tags/"):]
                     try:
                         tag_data = _http_json(
-                            f"https://api.github.com/repos/{owner}/{repo}/git/refs/tags/{tag}"
+                            f"https://api.github.com/repos/{owner}/{repo}/git/refs/tags/{urllib.parse.quote(tag, safe='')}"
                         )
                         sha = ((tag_data or {}).get("object") or {}).get("sha")
                     except Exception:
