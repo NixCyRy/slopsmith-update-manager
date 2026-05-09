@@ -50,7 +50,25 @@
     // stick across them. Compares the backend's process start_time
     // against the value last written to localStorage. On change with
     // pending entries: those updates are now live, clear pending.
-    async function syncProcessStartTime() {
+    //
+    // In-flight calls dedupe via _syncInFlight: updaterOnShow awaits
+    // it before showing the banner, then immediately calls
+    // updaterCheck which would otherwise refetch /start_time. Each
+    // resolved promise is single-use so subsequent unrelated calls
+    // (post-update, banner-dismiss…) still hit the network freshly.
+    let _syncInFlight = null;
+    function syncProcessStartTime() {
+        if (_syncInFlight) return _syncInFlight;
+        _syncInFlight = (async () => {
+            try {
+                return await _doSyncProcessStartTime();
+            } finally {
+                _syncInFlight = null;
+            }
+        })();
+        return _syncInFlight;
+    }
+    async function _doSyncProcessStartTime() {
         let started_at;
         try {
             const r = await fetch(API + '/start_time', { cache: 'no-store' });
