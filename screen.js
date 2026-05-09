@@ -641,7 +641,10 @@
     // updaterRenderUpdates() can render the new button in its disabled
     // spinner state. This avoids mutating the original click target after
     // a re-render has already replaced it.
-    let _checkOneError = null;
+    // Per-id deferred error slots. Multiple per-row checks can race,
+    // so a single shared slot would let a late failure clobber an
+    // earlier one before the earlier row got its '!' indicator.
+    const _checkOneErrors = new Map();
     window.updaterCheckOne = async function (btn) {
         const id = btn.dataset.pluginId;
         if (_inflightChecks.has(id)) return;
@@ -654,7 +657,7 @@
                 // Validation-level error (bad id, plugin not found).
                 // Surface on the freshly-rendered button after we drop
                 // the in-flight flag below.
-                _checkOneError = { id, message: data.error };
+                _checkOneErrors.set(id, data.error);
                 return;
             }
             if (data.update) updates[id] = data.update; else delete updates[id];
@@ -671,22 +674,24 @@
             if (data.excluded) excluded.add(id); else excluded.delete(id);
             if (data.bundled) bundledIds.add(id); else bundledIds.delete(id);
         } catch (e) {
-            _checkOneError = { id, message: e.message };
+            _checkOneErrors.set(id, e.message);
         } finally {
             _inflightChecks.delete(id);
             updaterRenderUpdates();
             updaterRefreshStatusUI();
             // Apply any deferred error indicator to the freshly-rendered
             // button. Done after re-render so we mutate the live element,
-            // not a detached one.
-            if (_checkOneError && _checkOneError.id === id) {
+            // not a detached one. Per-id slot means concurrent failing
+            // checks don't clobber each other.
+            if (_checkOneErrors.has(id)) {
+                const message = _checkOneErrors.get(id);
+                _checkOneErrors.delete(id);
                 const row = document.querySelector('[data-row-id="' + CSS.escape(id) + '"]');
                 const newBtn = row ? row.querySelector('button[onclick^="updaterCheckOne("]') : null;
                 if (newBtn) {
                     newBtn.textContent = '!';
-                    newBtn.title = _checkOneError.message;
+                    newBtn.title = message;
                 }
-                _checkOneError = null;
             }
         }
     };
