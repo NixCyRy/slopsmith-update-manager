@@ -123,7 +123,9 @@
         // surface the banner. Avoids flashing "restart pending" on a
         // server that's already running new code.
         await syncProcessStartTime();
-        if (localStorage.getItem(RESTART_KEY) === '1') {
+        let restartFlag = null;
+        try { restartFlag = localStorage.getItem(RESTART_KEY); } catch (e) { /* storage blocked */ }
+        if (restartFlag === '1') {
             document.getElementById('updater-restart-banner').classList.remove('hidden');
         }
         if (isDesktop) {
@@ -169,10 +171,11 @@
         status.textContent = '';
         table.innerHTML = '';
         try {
-            // Resolve external-restart drift before merging /updates
-            // so the freshly-fetched data is filtered against the
-            // post-clear pending set.
-            await syncProcessStartTime();
+            // Run start-time sync in parallel with the three data
+            // fetches. Awaited before the pending-id strip below
+            // so the freshly-fetched `updates` is filtered against
+            // the post-clear pending set.
+            const syncP = syncProcessStartTime();
             const [pRes, uRes, cRes] = await Promise.all([
                 fetch('/api/plugins'),
                 fetch(API + '/updates'),
@@ -186,6 +189,7 @@
             excluded = new Set(uData.excluded || []);
             bundledIds = new Set(uData.bundled || []);
             coreStatus = await cRes.json();
+            await syncP;
             // Strip pending-restart ids from `updates` so the backend
             // can't re-introduce them between Update click and
             // restart. The marker write at update time may not yet
