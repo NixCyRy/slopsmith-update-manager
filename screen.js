@@ -2,6 +2,7 @@
 (function () {
     const RESTART_KEY = 'update_manager:restartPending';
     const PENDING_IDS_KEY = 'update_manager:pendingRestartIds';
+    const START_TIME_KEY = 'update_manager:knownStartTime';
     const API = '/api/plugins/update_manager';
     const CORE_KEY = '__core__';
 
@@ -44,6 +45,60 @@
         try { localStorage.removeItem(PENDING_IDS_KEY); } catch (e) { /* ignore */ }
     }
 
+    // Detect external server restarts (docker compose restart, host
+    // kill, …) so the per-row "Updated · restart to apply" UI doesn't
+    // stick across them. Compares the backend's process start_time
+    // against the value last written to localStorage. On change with
+    // pending entries: those updates are now live, clear pending.
+    //
+    // In-flight calls dedupe via _syncInFlight: updaterOnShow awaits
+    // it before showing the banner, then immediately calls
+    // updaterCheck which would otherwise refetch /start_time. Each
+    // resolved promise is single-use so subsequent unrelated calls
+    // (post-update, banner-dismiss…) still hit the network freshly.
+    let _syncInFlight = null;
+    function syncProcessStartTime() {
+        if (_syncInFlight) return _syncInFlight;
+        _syncInFlight = (async () => {
+            try {
+                return await _doSyncProcessStartTime();
+            } finally {
+                _syncInFlight = null;
+            }
+        })();
+        return _syncInFlight;
+    }
+    async function _doSyncProcessStartTime() {
+        let started_at;
+        try {
+            const r = await fetch(API + '/start_time', { cache: 'no-store' });
+            const j = await r.json();
+            started_at = (j && typeof j.started_at === 'number') ? j.started_at : null;
+        } catch (e) { started_at = null; }
+        if (started_at === null) return;
+        let prev = null;
+        try {
+            const raw = localStorage.getItem(START_TIME_KEY);
+            prev = raw ? Number(raw) : null;
+            if (!Number.isFinite(prev)) prev = null;
+        } catch (e) { prev = null; }
+        if (prev !== null && prev !== started_at) {
+            // Clear any restart-pending state held over from before
+            // the restart. _pendingRestart covers per-plugin updates;
+            // RESTART_KEY also gets set by core-update flows that
+            // never touch _pendingRestart, so check both.
+            let restartFlag = null;
+            try { restartFlag = localStorage.getItem(RESTART_KEY); } catch (e) { /* ignore */ }
+            if (_pendingRestart.size > 0 || restartFlag === '1') {
+                clearPendingRestart();
+                try { localStorage.removeItem(RESTART_KEY); } catch (e) { /* ignore */ }
+                const banner = document.getElementById('updater-restart-banner');
+                if (banner) banner.classList.add('hidden');
+            }
+        }
+        try { localStorage.setItem(START_TIME_KEY, String(started_at)); } catch (e) { /* ignore */ }
+    }
+
     // Refresh the "N updates available" status text and Update-all
     // button visibility from current state. Called after any flow that
     // mutates `updates` / `excluded` / `coreStatus`. Centralised so the
@@ -82,7 +137,13 @@
             const cfg = await r.json();
             isDesktop = cfg.is_desktop ?? isDesktop;
         } catch (e) { /* fall back to window.slopsmithDesktop */ }
-        if (localStorage.getItem(RESTART_KEY) === '1') {
+        // Resolve external-restart drift before deciding whether to
+        // surface the banner. Avoids flashing "restart pending" on a
+        // server that's already running new code.
+        await syncProcessStartTime();
+        let restartFlag = null;
+        try { restartFlag = localStorage.getItem(RESTART_KEY); } catch (e) { /* storage blocked */ }
+        if (restartFlag === '1') {
             document.getElementById('updater-restart-banner').classList.remove('hidden');
         }
         if (isDesktop) {
@@ -128,6 +189,11 @@
         status.textContent = '';
         table.innerHTML = '';
         try {
+            // Run start-time sync in parallel with the three data
+            // fetches. Awaited before the pending-id strip below
+            // so the freshly-fetched `updates` is filtered against
+            // the post-clear pending set.
+            const syncP = syncProcessStartTime();
             const [pRes, uRes, cRes] = await Promise.all([
                 fetch('/api/plugins'),
                 fetch(API + '/updates'),
@@ -141,6 +207,7 @@
             excluded = new Set(uData.excluded || []);
             bundledIds = new Set(uData.bundled || []);
             coreStatus = await cRes.json();
+            await syncP;
             // Strip pending-restart ids from `updates` so the backend
             // can't re-introduce them between Update click and
             // restart. The marker write at update time may not yet

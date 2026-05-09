@@ -20,6 +20,9 @@ A plugin for [Slopsmith](https://github.com/byrongamatos/slopsmith) that install
 
 ## What's New
 
+### v1.8.2
+- **Detect external restarts** — the per-row "Updated · restart to apply" UI now clears itself when the server has been restarted outside the in-app "Restart now" flow (e.g. `docker compose restart`, host-side process kill). New `GET /api/plugins/update_manager/start_time` endpoint exposes the process start time; the frontend records it in `localStorage["update_manager:knownStartTime"]` and clears pending state + the restart banner when it sees the value change.
+
 ### v1.8.1
 - **Fix stuck "Update available" after `git pull`** — `_resolve_source` now picks the freshest of the marker (`installed_at`, falling back to the marker file's own mtime if missing/malformed) and the git ref's mtime — where "git ref" means whichever file the SHA was actually read from: `.git/refs/heads/<branch>` for loose refs, `.git/packed-refs` for packed-ref repos, or `.git/HEAD` for detached-HEAD checkouts. Cloned plugins whose marker is older than the current ref no longer appear behind forever; UI-zip-updated cloned plugins still surface the marker since it gets a newer `installed_at` than the preserved `.git/`. Bonus: per-row "Updated · restart to apply" status appears on plugins immediately after clicking Update, replacing the stale "Update available" until the user restarts.
 
@@ -104,6 +107,7 @@ All endpoints are namespaced under `/api/plugins/update_manager/`:
 | GET    | `/registry`                 | Parses slopsmith's README and returns the plugin list |
 | GET    | `/updates`                  | Compares installed plugins against GitHub    |
 | GET    | `/check/{plugin_id}`        | Re-checks one plugin. Success: `{plugin_id, update, error, source, excluded, bundled}`. Validation failure (invalid id / not installed): `{error}` only (no `plugin_id`) |
+| GET    | `/start_time`               | Returns `{started_at}` (server process start time, seconds since epoch). Used by the UI to detect external restarts. |
 | POST   | `/install`                  | Body `{url, dirname}` — installs from a GitHub repo |
 | POST   | `/update/{plugin_id}`       | Re-downloads latest source and swaps         |
 | POST   | `/uninstall/{plugin_id}`    | Removes the plugin directory                 |
