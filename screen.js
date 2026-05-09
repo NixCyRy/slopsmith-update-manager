@@ -64,11 +64,19 @@
             prev = raw ? Number(raw) : null;
             if (!Number.isFinite(prev)) prev = null;
         } catch (e) { prev = null; }
-        if (prev !== null && prev !== started_at && _pendingRestart.size > 0) {
-            clearPendingRestart();
-            try { localStorage.removeItem(RESTART_KEY); } catch (e) { /* ignore */ }
-            const banner = document.getElementById('updater-restart-banner');
-            if (banner) banner.classList.add('hidden');
+        if (prev !== null && prev !== started_at) {
+            // Clear any restart-pending state held over from before
+            // the restart. _pendingRestart covers per-plugin updates;
+            // RESTART_KEY also gets set by core-update flows that
+            // never touch _pendingRestart, so check both.
+            let restartFlag = null;
+            try { restartFlag = localStorage.getItem(RESTART_KEY); } catch (e) { /* ignore */ }
+            if (_pendingRestart.size > 0 || restartFlag === '1') {
+                clearPendingRestart();
+                try { localStorage.removeItem(RESTART_KEY); } catch (e) { /* ignore */ }
+                const banner = document.getElementById('updater-restart-banner');
+                if (banner) banner.classList.add('hidden');
+            }
         }
         try { localStorage.setItem(START_TIME_KEY, String(started_at)); } catch (e) { /* ignore */ }
     }
