@@ -412,8 +412,13 @@
             // Per-row recheck. Useful after the bulk cold pass exhausts
             // GitHub's anonymous rate limit and leaves some rows in
             // "Check failed" — the user can retry one row at a time.
-            // Hidden for bundled plugins (managed by core, not GitHub).
-            const checkBtn = !isBundled
+            // Hidden for bundled plugins (managed by core) and for rows
+            // with no resolvable GitHub source — the endpoint can't
+            // actually contact a remote in that case, so the button +
+            // tooltip would be misleading. Excluded rows still get the
+            // button so the user can sync state without a network call.
+            const canRecheck = !isBundled && !!(src && src.url);
+            const checkBtn = canRecheck
                 ? `<button data-plugin-id="${esc(p.id)}" onclick="updaterCheckOne(this)"
                         class="text-gray-500 hover:text-white text-xs transition"
                         title="Re-check this plugin against GitHub now">Check</button>`
@@ -640,8 +645,14 @@
             }
             if (data.update) updates[id] = data.update; else delete updates[id];
             if (data.error)  updateErrors[id] = data.error; else delete updateErrors[id];
+            // Replace, don't merge — the backend already returns the full
+            // per-plugin source (Phase 1 fields + _check_one's
+            // source_updates). Merging would leave stale repo/url/branch
+            // fields if a plugin's source can no longer be resolved.
             if (data.source && Object.keys(data.source).length) {
-                sources[id] = { ...(sources[id] || {}), ...data.source };
+                sources[id] = data.source;
+            } else {
+                delete sources[id];
             }
             if (data.excluded) excluded.add(id); else excluded.delete(id);
             if (data.bundled) bundledIds.add(id); else bundledIds.delete(id);
