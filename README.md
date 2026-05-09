@@ -100,7 +100,7 @@ All endpoints are namespaced under `/api/plugins/update_manager/`:
 |--------|-----------------------------|----------------------------------------------|
 | GET    | `/registry`                 | Parses slopsmith's README and returns the plugin list |
 | GET    | `/updates`                  | Compares installed plugins against GitHub    |
-| GET    | `/check/{plugin_id}`        | Re-checks one plugin (returns `{plugin_id, update, error, source, excluded, bundled}`) |
+| GET    | `/check/{plugin_id}`        | Re-checks one plugin. Success: `{plugin_id, update, error, source, excluded, bundled}`. Validation failure (invalid id / not installed): `{error}` only (no `plugin_id`) |
 | POST   | `/install`                  | Body `{url, dirname}` — installs from a GitHub repo |
 | POST   | `/update/{plugin_id}`       | Re-downloads latest source and swaps         |
 | POST   | `/uninstall/{plugin_id}`    | Removes the plugin directory                 |

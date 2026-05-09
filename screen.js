@@ -307,6 +307,10 @@
             const r = await fetch(API + '/core');
             coreStatus = await r.json();
             updaterRenderCore();
+            // Core state feeds the status counter (coreBehind) and
+            // Update-all visibility (coreUpdatable). Refresh after a
+            // core init / update so the header doesn't lag the card.
+            updaterRefreshStatusUI();
         } catch (e) { /* ignore */ }
     }
 
