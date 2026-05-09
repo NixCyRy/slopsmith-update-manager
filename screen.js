@@ -425,12 +425,12 @@
             // Per-row recheck. Useful after the bulk cold pass exhausts
             // GitHub's anonymous rate limit and leaves some rows in
             // "Check failed" — the user can retry one row at a time.
-            // Hidden for bundled plugins (managed by core) and for rows
-            // with no resolvable GitHub source — the endpoint can't
-            // actually contact a remote in that case, so the button +
-            // tooltip would be misleading. Excluded rows still get the
-            // button so the user can sync state without a network call.
-            const canRecheck = !isBundled && !!(src && src.url);
+            // Hidden for bundled plugins (managed by core). For non-
+            // bundled rows, shown when EITHER the source resolves
+            // (network recheck) OR the row is excluded (state-only
+            // re-sync — backend short-circuits without a GitHub call
+            // and just confirms exclusion + bundled flags).
+            const canRecheck = !isBundled && (isExcluded || !!(src && src.url));
             const checking = _inflightChecks.has(p.id);
             // Excluded rows skip the GitHub round-trip on the backend
             // and only re-sync local state — phrase the tooltip
