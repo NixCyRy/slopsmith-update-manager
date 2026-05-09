@@ -712,8 +712,17 @@ def _resolve_source(plugin_dir: Path) -> dict | None:
     UI-zip-updated, or zip-installed plugin that was later git-cloned
     on top), pick whichever has the more recent local provenance:
 
-      - marker freshness  = `installed_at` in .slopsmith-installed.json
-      - git freshness     = mtime of .git/refs/heads/<branch> (or HEAD)
+      - marker freshness = `installed_at` in .slopsmith-installed.json
+        (falls back to the marker file's own mtime when `installed_at`
+        is missing or malformed)
+      - git freshness    = mtime of the actual file _read_git_local_sha
+        resolved the sha from. That's:
+          .git/refs/heads/<branch>   for loose-ref checkouts
+          .git/packed-refs           for repos using packed-refs
+          .git/HEAD                  for detached-HEAD checkouts
+        Using the actual sha-source file matters: `git pull` rewrites
+        whichever of these holds the branch tip, so its mtime is the
+        one that advances on a fetch.
 
     This avoids two symmetric "stuck local_sha" failure modes:
       - Without freshness: a `git pull` would advance HEAD past the

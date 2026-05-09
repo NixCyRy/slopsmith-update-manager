@@ -50,7 +50,12 @@
     // counter rules don't drift between bulk check, exclusion toggle,
     // and per-row recheck.
     function updaterRefreshStatusUI() {
-        const pluginCount = Object.keys(updates).length;
+        // Pending-restart ids are functionally up-to-date locally —
+        // their new code is staged on disk; only the running process
+        // is stale. Don't count them in the header, don't show
+        // Update-all for them, don't let updaterUpdateAll re-pick
+        // them on the next pass.
+        const pluginCount = Object.keys(updates).filter(id => !_pendingRestart.has(id)).length;
         const coreBehind = !!(coreStatus && coreStatus.behind && !coreStatus.excluded);
         const total = pluginCount + (coreBehind ? 1 : 0);
         const statusEl = document.getElementById('updater-status');
@@ -136,6 +141,16 @@
             excluded = new Set(uData.excluded || []);
             bundledIds = new Set(uData.bundled || []);
             coreStatus = await cRes.json();
+            // Strip pending-restart ids from `updates` so the backend
+            // can't re-introduce them between Update click and
+            // restart. The marker write at update time may not yet
+            // reflect on the GitHub-cached side, and we don't want
+            // to revert the row's pending-restart UI just because
+            // the bulk recheck still sees mismatched shas.
+            for (const id of _pendingRestart) {
+                delete updates[id];
+                delete updateErrors[id];
+            }
             updaterRenderCore();
             updaterRenderUpdates();
             document.getElementById('updater-last-checked').textContent =
@@ -710,8 +725,17 @@
                 _checkOneErrors.set(id, data.error);
                 return;
             }
-            if (data.update) updates[id] = data.update; else delete updates[id];
-            if (data.error)  updateErrors[id] = data.error; else delete updateErrors[id];
+            // Pending-restart wins — backend may still report the
+            // pre-update mismatch until its cache turns over and the
+            // marker write lands. Don't let the per-row recheck
+            // revert the "Updated · restart to apply" UI.
+            if (_pendingRestart.has(id)) {
+                delete updates[id];
+                delete updateErrors[id];
+            } else {
+                if (data.update) updates[id] = data.update; else delete updates[id];
+                if (data.error)  updateErrors[id] = data.error; else delete updateErrors[id];
+            }
             // Replace, don't merge — the backend already returns the full
             // per-plugin source (Phase 1 fields + _check_one's
             // source_updates). Merging would leave stale repo/url/branch
@@ -794,6 +818,10 @@
 
         for (const id of Object.keys(updates)) {
             if (excluded.has(id)) continue;
+            // Pending-restart plugins are functionally up-to-date —
+            // the new code is on disk; only the running process is
+            // stale. Skip so Update-all doesn't re-pick them.
+            if (_pendingRestart.has(id)) continue;
             const row = document.querySelector('[data-row-id="' + CSS.escape(id) + '"]');
             // Match the Update button specifically — the row may also
             // hold a "Check" button with data-plugin-id since v1.8.0.
