@@ -244,22 +244,38 @@ def _read_git_origin(plugin_dir: Path) -> str | None:
     return m.group(1) if m else None
 
 
-def _read_git_local_sha(plugin_dir: Path) -> tuple[str | None, str | None]:
-    """Return (sha, branch) for a `.git`-managed plugin dir, without git CLI."""
+def _read_git_local_sha(plugin_dir: Path) -> tuple[str | None, str | None, Path | None]:
+    """Return (sha, branch, sha_source) for a `.git`-managed plugin dir.
+
+    `sha_source` is the file the sha was actually read from — the loose
+    ref file, .git/packed-refs, or .git/HEAD (detached). Callers that
+    need to gauge "when was this sha last updated" (e.g. for freshness
+    comparisons) should stat this path rather than guessing at HEAD.
+
+    Branch names with slashes (e.g. `feature/foo`) are preserved
+    verbatim — the ref name is the bit after `refs/heads/`, kept whole.
+    """
     head = plugin_dir / ".git" / "HEAD"
     if not head.exists():
-        return None, None
+        return None, None, None
     try:
         h = head.read_text().strip()
     except Exception:
-        return None, None
+        return None, None, None
     if h.startswith("ref: "):
         ref_name = h[5:].strip()
-        branch = ref_name.split("/")[-1] if "/" in ref_name else ref_name
+        # Strip the leading category (refs/heads/, refs/tags/, ...) so
+        # the returned `branch` value is the user-facing name. Handles
+        # multi-slash branch names like `feature/foo` correctly.
+        branch = ref_name
+        for prefix in ("refs/heads/", "refs/tags/", "refs/remotes/"):
+            if branch.startswith(prefix):
+                branch = branch[len(prefix):]
+                break
         ref_path = plugin_dir / ".git" / ref_name
         if ref_path.exists():
             try:
-                return ref_path.read_text().strip(), branch
+                return ref_path.read_text().strip(), branch, ref_path
             except Exception:
                 pass
         packed = plugin_dir / ".git" / "packed-refs"
@@ -267,11 +283,12 @@ def _read_git_local_sha(plugin_dir: Path) -> tuple[str | None, str | None]:
             try:
                 for ln in packed.read_text().splitlines():
                     if ln.endswith(" " + ref_name):
-                        return ln.split()[0], branch
+                        return ln.split()[0], branch, packed
             except Exception:
                 pass
-        return None, branch
-    return h, None
+        return None, branch, None
+    # Detached HEAD — the sha is in HEAD itself.
+    return h, None, head
 
 
 def _default_branch(owner: str, repo: str) -> str:
@@ -717,22 +734,22 @@ def _resolve_source(plugin_dir: Path) -> dict | None:
     if git_origin:
         owner, repo = _parse_repo_url(git_origin)
         if owner:
-            local_sha, branch = _read_git_local_sha(plugin_dir)
+            local_sha, branch, sha_source = _read_git_local_sha(plugin_dir)
             if local_sha:
-                # Pick the ref file we actually read the sha from so
-                # the mtime reflects the last fetch / commit on the
-                # branch. Falls back to HEAD when the ref file is
-                # missing (packed-refs case) — slightly less precise
-                # but still moves on `git pull`.
-                ref_path = plugin_dir / ".git" / "HEAD"
-                if branch:
-                    branch_ref = plugin_dir / ".git" / "refs" / "heads" / branch
-                    if branch_ref.exists():
-                        ref_path = branch_ref
-                try:
-                    git_freshness = int(ref_path.stat().st_mtime)
-                except Exception:
-                    git_freshness = 0
+                # Stat the same file the sha was actually read from so
+                # the mtime tracks the last advance of THIS sha. That's
+                # .git/refs/heads/<branch> for loose refs (handles
+                # multi-slash names like feature/foo correctly),
+                # .git/packed-refs for packed refs (which IS the file
+                # `git pull` rewrites in that case — .git/HEAD wouldn't
+                # move when staying on the same branch), or .git/HEAD
+                # for detached-HEAD checkouts.
+                git_freshness = 0
+                if sha_source is not None:
+                    try:
+                        git_freshness = int(sha_source.stat().st_mtime)
+                    except Exception:
+                        git_freshness = 0
                 candidates.append({
                     "owner": owner, "repo": repo,
                     "branch": branch,
