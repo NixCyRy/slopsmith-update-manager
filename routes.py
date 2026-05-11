@@ -1107,23 +1107,22 @@ def _check_one(name: str, info: dict, bulk: bool = True) -> tuple[str, dict | No
         if remote_version is None:
             tried = "main, master" if not hint_branch else f"'{branch}'"
             if status == "not_found":
-                if hint_branch:
-                    # The marker/git pins this plugin to a branch that
-                    # genuinely isn't on the remote (renamed/deleted).
-                    # `apply_update` would still pull this branch, so
-                    # don't pretend it's up to date and don't silently
-                    # look at main — surface the branch name so the
-                    # user can fix the marker or push the branch.
-                    return name, None, {
-                        "code": "branch_not_on_remote",
-                        "branch": branch,
-                        "message": f"Branch '{branch}' not on {owner}/{repo}",
-                    }, source_updates
-                # No pinned branch and neither main nor master exists —
-                # weird, but treat it as "couldn't reach repo".
+                # A raw 404/410 on .../<branch>/plugin.json is ambiguous:
+                # it could mean the branch doesn't exist, the REPO
+                # doesn't exist, or plugin.json simply isn't on that
+                # branch. Bulk mode (raw fetches only) can't tell which.
+                # So use a `manifest_not_found` code with an honest,
+                # still-actionable message rather than the stronger
+                # `branch_not_on_remote` claim — which `_check_one`'s
+                # full-check (bulk=False) path DOES emit, but only on a
+                # 422 from the commits API, where the evidence is solid.
+                # `apply_update` would still pull `branch` either way, so
+                # this is the right thing for the user to act on.
+                where = f"at {owner}/{repo}@{branch}" if hint_branch else f"at {owner}/{repo} (tried main, master)"
                 return name, None, {
-                    "code": "version_unavailable",
-                    "message": f"No main/master branch on {owner}/{repo}",
+                    "code": "manifest_not_found",
+                    "branch": branch,
+                    "message": f"plugin.json not found {where} — the branch, repo, or manifest file may be missing",
                 }, source_updates
             if status == "no_version":
                 # The manifest was fetched fine — it just has no usable
