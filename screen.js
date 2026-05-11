@@ -493,8 +493,22 @@
                     const br = errObj.branch || 'unknown';
                     statusHtml = `<span class="text-sky-400 font-semibold text-xs" title="Switch to the published branch (usually main), or push '${esc(br)}' to origin">Branch not published</span>
                         <div class="text-[10px] text-gray-600 mt-0.5">Local branch <code class="text-gray-400">${esc(br)}</code> not on remote</div>`;
+                } else if (errObj.code === 'source_unresolved') {
+                    statusHtml = `<span class="text-amber-400 text-xs" title="${esc(errObj.message || '')}">Source unknown</span>
+                        <div class="text-[10px] text-gray-600 mt-0.5">Re-install via Browse to record its repo</div>`;
+                } else if (errObj.code === 'manifest_not_found') {
+                    const br = errObj.branch ? esc(errObj.branch) : '';
+                    statusHtml = `<span class="text-amber-400 text-xs" title="${esc(errObj.message || '')}">Manifest not found</span>
+                        <div class="text-[10px] text-gray-600 mt-0.5">${br ? `Branch <code class="text-gray-400">${br}</code> / repo / plugin.json may be missing` : 'Branch, repo, or plugin.json may be missing'} — click Check for details</div>`;
+                } else if (errObj.code === 'manifest_no_version') {
+                    statusHtml = `<span class="text-amber-400 text-xs" title="${esc(errObj.message || '')}">Manifest has no version</span>
+                        <div class="text-[10px] text-gray-600 mt-0.5">Plugin author needs to add a version field</div>`;
+                } else if (errObj.code === 'version_unavailable') {
+                    statusHtml = `<span class="text-amber-400 text-xs" title="${esc(errObj.message || '')}">Couldn't reach repo</span>
+                        <div class="text-[10px] text-gray-600 mt-0.5">Click Check to retry</div>`;
                 } else {
-                    statusHtml = `<span class="text-red-400 text-xs" title="${esc(errObj.message || 'Check failed')}">Check failed</span>`;
+                    statusHtml = `<span class="text-red-400 text-xs" title="${esc(errObj.message || 'Check failed')}">Check failed</span>
+                        <div class="text-[10px] text-gray-600 mt-0.5">Click Check to retry</div>`;
                 }
                 actionHtml = `<span class="text-gray-600 text-xs">—</span>`;
             } else if (isSelf) {
@@ -547,15 +561,18 @@
                         title="Pin this plugin to a specific version (upgrade or downgrade)">Versions</button>`
                 : '';
 
-            // Per-row recheck. Useful after the bulk cold pass exhausts
-            // GitHub's anonymous rate limit and leaves some rows in
-            // "Check failed" — the user can retry one row at a time.
-            // Hidden for bundled plugins (managed by core). For non-
-            // bundled rows, shown when EITHER the source resolves
-            // (network recheck) OR the row is excluded (state-only
-            // re-sync — backend short-circuits without a GitHub call
-            // and just confirms exclusion + bundled flags).
-            const canRecheck = !isBundled && (isExcluded || !!(src && src.url));
+            // Per-row recheck. ALWAYS shown for non-bundled (external)
+            // plugins — the backend's /check/{id} endpoint does the full
+            // check, force-refreshes the registry if the source couldn't
+            // be resolved on the cold pass, and never depends on the
+            // bulk pass having succeeded. (The bulk /updates pass makes
+            // zero api.github.com calls, so the entire 60/hour budget is
+            // available for these on-demand single-plugin checks — an
+            // end user can always re-check and update any individual
+            // external plugin, even right after a cold first run.)
+            // Bundled plugins are managed by slopsmith core; no Check
+            // button for them.
+            const canRecheck = !isBundled;
             const checking = _inflightChecks.has(p.id);
             // Excluded rows skip the GitHub round-trip on the backend
             // and only re-sync local state — phrase the tooltip
