@@ -496,6 +496,9 @@
                 } else if (errObj.code === 'source_unresolved') {
                     statusHtml = `<span class="text-amber-400 text-xs" title="${esc(errObj.message || '')}">Source unknown</span>
                         <div class="text-[10px] text-gray-600 mt-0.5">Re-install via Browse to record its repo</div>`;
+                } else if (errObj.code === 'manifest_no_version') {
+                    statusHtml = `<span class="text-amber-400 text-xs" title="${esc(errObj.message || '')}">Manifest has no version</span>
+                        <div class="text-[10px] text-gray-600 mt-0.5">Plugin author needs to add a version field</div>`;
                 } else if (errObj.code === 'version_unavailable') {
                     statusHtml = `<span class="text-amber-400 text-xs" title="${esc(errObj.message || '')}">Couldn't reach repo</span>
                         <div class="text-[10px] text-gray-600 mt-0.5">Click Check to retry</div>`;

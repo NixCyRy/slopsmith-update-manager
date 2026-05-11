@@ -1007,15 +1007,23 @@ def _remote_version_any_branch(owner: str, repo: str, hint_branch: str | None = 
                            404/410 — genuinely not there. Caller can
                            surface a "branch not on remote" error.
       status="no_version"  plugin.json was fetched but has no usable
-                           `version` field.
+                           `version` field (malformed manifest).
       status="error"       transient failure (5xx, network, rate-limit
                            with no stale copy) — retryable. Caller
                            should NOT report it as "branch not there".
     On any non-ok status, version is None; branch is the hint (so the
     caller knows what we tried) or None when there was no hint.
+
+    When more than one candidate branch is tried (the no-hint case:
+    main then master) and they fail with different statuses, the
+    returned status is the most-actionable one by precedence
+    error > no_version > not_found — so e.g. "main exists but its
+    manifest has no version, master 404s" reports `no_version`, not
+    `not_found`.
     """
     candidates: list[str] = [hint_branch] if hint_branch else ["main", "master"]
-    last_status = "not_found"  # if every candidate is missing, that's the verdict
+    saw_error = False
+    saw_no_version = False
     for b in candidates:
         try:
             text = _conditional_fetch_text(
@@ -1023,13 +1031,16 @@ def _remote_version_any_branch(owner: str, repo: str, hint_branch: str | None = 
                 key=f"version:{owner}/{repo}@{b}",
             )
         except urllib.error.HTTPError as e:
-            last_status = "not_found" if e.code in (404, 410) else "error"
+            if e.code not in (404, 410):
+                saw_error = True
             continue
         except Exception:
-            last_status = "error"
+            saw_error = True
             continue
         if not text:
-            last_status = "error"  # _conditional_fetch_text returned None for a non-2xx we didn't classify
+            # _conditional_fetch_text returned None for a non-2xx it
+            # didn't classify (no body, no stale copy) — treat as transient.
+            saw_error = True
             continue
         try:
             v = (json.loads(text) or {}).get("version")
@@ -1037,8 +1048,9 @@ def _remote_version_any_branch(owner: str, repo: str, hint_branch: str | None = 
             v = None
         if isinstance(v, str) and v:
             return v, b, "ok"
-        last_status = "no_version"
-    return None, (hint_branch or None), last_status
+        saw_no_version = True
+    status = "error" if saw_error else ("no_version" if saw_no_version else "not_found")
+    return None, (hint_branch or None), status
 
 
 # `_check_one` runs in two modes (see the `bulk` flag below):
@@ -1113,17 +1125,22 @@ def _check_one(name: str, info: dict, bulk: bool = True) -> tuple[str, dict | No
                     "code": "version_unavailable",
                     "message": f"No main/master branch on {owner}/{repo}",
                 }, source_updates
-            # status == "error" or "no_version": transient / malformed,
-            # NOT "branch missing". Phrase it as retryable so the Check
-            # button is the obvious next step and we don't slander a
-            # perfectly-fine branch as unpublished over a 5xx blip.
+            if status == "no_version":
+                # The manifest was fetched fine — it just has no usable
+                # `version` field. Distinct code so the UI doesn't tell
+                # the user it's a connectivity problem; nothing to
+                # retry until the plugin author fixes the manifest.
+                return name, None, {
+                    "code": "manifest_no_version",
+                    "message": f"plugin.json on {owner}/{repo} ({tried}) has no version field",
+                }, source_updates
+            # status == "error": transient (5xx, network, rate-limit
+            # with no stale copy). Retryable; the Check button is the
+            # obvious next step. We don't slander a fine branch as
+            # unpublished over a blip.
             return name, None, {
                 "code": "version_unavailable",
-                "message": (
-                    f"Couldn't read plugin.json version from {owner}/{repo} ({tried}) — "
-                    + ("manifest has no version field" if status == "no_version"
-                       else "transient fetch error, retry")
-                ),
+                "message": f"Couldn't read plugin.json version from {owner}/{repo} ({tried}) — transient fetch error, retry",
             }, source_updates
         if _remote_is_newer(local_version, remote_version):
             return name, {
