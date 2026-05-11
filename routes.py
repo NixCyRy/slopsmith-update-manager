@@ -380,10 +380,16 @@ def _remote_cache_get_dict() -> dict:
         return _remote_cache
 
 
-def _remote_cache_save() -> None:
-    cache = _remote_cache
-    if cache is None:
-        return
+def _remote_cache_save_locked(cache: dict) -> None:
+    """Serialise `cache` to disk. CALLER MUST HOLD `_remote_cache_lock`.
+
+    Iterating `cache` via `json.dumps` while another thread inserts a
+    key would raise "dictionary changed size during iteration", and two
+    threads writing the file concurrently could interleave — both are
+    real hazards now that the bulk `/updates` pass runs `_cache_put`
+    from a 10-worker ThreadPoolExecutor. Holding the lock for the
+    mutation + the save serialises all of it.
+    """
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         REMOTE_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
@@ -399,6 +405,11 @@ def _cache_entry(key: str) -> dict | None:
     Differs from _cache_get in that it returns the entry even when
     expired — callers that do conditional refetch want the etag from
     the stale entry to send If-None-Match.
+
+    Lock-free: `dict.get` is atomic under the GIL, and the entry dict
+    it returns is only ever replaced wholesale (never mutated in place
+    except for `expires_at`, under the lock), so a reader at worst sees
+    a one-tick-stale `expires_at` — harmless.
     """
     cache = _remote_cache_get_dict()
     entry = cache.get(key)
@@ -416,22 +427,24 @@ def _cache_get(key: str):
 
 
 def _cache_put(key: str, value, etag: str | None = None, ttl_s: int = _REMOTE_CACHE_TTL_S) -> None:
-    cache = _remote_cache_get_dict()
-    cache[key] = {
-        "value": value,
-        "etag": etag,
-        "expires_at": time.time() + ttl_s,
-    }
-    _remote_cache_save()
+    cache = _remote_cache_get_dict()  # may briefly take the lock for lazy init, then releases it
+    with _remote_cache_lock:
+        cache[key] = {
+            "value": value,
+            "etag": etag,
+            "expires_at": time.time() + ttl_s,
+        }
+        _remote_cache_save_locked(cache)
 
 
 def _cache_refresh_ttl(key: str, ttl_s: int = _REMOTE_CACHE_TTL_S) -> None:
     """Bump expires_at without changing value — used after a 304."""
     cache = _remote_cache_get_dict()
-    entry = cache.get(key)
-    if isinstance(entry, dict):
-        entry["expires_at"] = time.time() + ttl_s
-        _remote_cache_save()
+    with _remote_cache_lock:
+        entry = cache.get(key)
+        if isinstance(entry, dict):
+            entry["expires_at"] = time.time() + ttl_s
+            _remote_cache_save_locked(cache)
 
 
 def _cache_expire(key: str) -> None:
@@ -442,10 +455,11 @@ def _cache_expire(key: str) -> None:
     previously-failed registry / source resolution on demand.
     """
     cache = _remote_cache_get_dict()
-    entry = cache.get(key)
-    if isinstance(entry, dict):
-        entry["expires_at"] = 0
-        _remote_cache_save()
+    with _remote_cache_lock:
+        entry = cache.get(key)
+        if isinstance(entry, dict):
+            entry["expires_at"] = 0
+            _remote_cache_save_locked(cache)
 
 
 def _conditional_fetch_json(url: str, key: str, ttl_s: int = _REMOTE_CACHE_TTL_S):
@@ -1003,9 +1017,16 @@ def _remote_version_any_branch(owner: str, repo: str, hint_branch: str | None = 
 
     Returns (version, branch_that_worked, status):
       status="ok"          version + branch are valid
-      status="not_found"   the branch (or plugin.json on it) returned
-                           404/410 — genuinely not there. Caller can
-                           surface a "branch not on remote" error.
+      status="not_found"   raw.githubusercontent.com returned 404/410
+                           for .../<branch>/plugin.json. This is
+                           AMBIGUOUS — it can mean the branch doesn't
+                           exist, the repo doesn't exist, OR plugin.json
+                           simply isn't on that branch. Callers must
+                           NOT claim a definite "branch not on remote";
+                           use a `manifest_not_found`-style code. (The
+                           full-check path proves a true branch-missing
+                           condition separately via a 422 from the
+                           commits API.)
       status="no_version"  plugin.json was fetched but has no usable
                            `version` field (malformed manifest).
       status="error"       transient failure (5xx, network, rate-limit
