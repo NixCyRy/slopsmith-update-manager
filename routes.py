@@ -934,9 +934,10 @@ def _version_tuple(v: str | None) -> tuple | None:
                                            bump in the bulk pass but the
                                            per-plugin Check still catches it)
 
-    Returns None only when the numeric core still doesn't parse (e.g.
-    "rolling", "" , "2024-01"), so callers fall back to string
-    inequality for genuinely non-numeric schemes.
+    Returns None when the numeric core still doesn't parse (e.g.
+    "rolling", "" , "2024-01"). The sole caller, `_remote_is_newer`,
+    treats a None on either side as "ordering unknown" and does NOT
+    flag an update — see its docstring for the rationale.
     """
     if not isinstance(v, str) or not v:
         return None
@@ -982,7 +983,7 @@ def _remote_is_newer(local_version: str | None, remote_version: str | None) -> b
     return False
 
 
-def _remote_version_any_branch(owner: str, repo: str, hint_branch: str | None = None) -> tuple[str | None, str | None]:
+def _remote_version_any_branch(owner: str, repo: str, hint_branch: str | None = None) -> tuple[str | None, str | None, str]:
     """Read plugin.json's `version` from the repo via raw.githubusercontent.com.
 
     Branch selection:
@@ -990,9 +991,7 @@ def _remote_version_any_branch(owner: str, repo: str, hint_branch: str | None = 
         branch. Don't silently fall back to main/master — the tracked
         branch IS the source of truth, and `apply_update` will pull
         from it; falling back here would report an update against a
-        branch the Update flow won't actually use. A 404 on the hint
-        branch ⇒ (None, hint_branch) so the caller can surface a
-        "branch not on remote" error against the right branch name.
+        branch the Update flow won't actually use.
       - hint_branch absent (a registry/heuristic/manifest-resolved
         plugin where we don't actually know the branch): try 'main'
         then 'master'.
@@ -1002,19 +1001,44 @@ def _remote_version_any_branch(owner: str, repo: str, hint_branch: str | None = 
     unauthenticated 60/hour API rate limit no matter how many plugins
     we check.
 
-    Returns (version, branch_that_worked) on success; on failure
-    returns (None, hint_branch) when a hint was given (so the caller
-    knows which branch we tried), else (None, None).
+    Returns (version, branch_that_worked, status):
+      status="ok"          version + branch are valid
+      status="not_found"   the branch (or plugin.json on it) returned
+                           404/410 — genuinely not there. Caller can
+                           surface a "branch not on remote" error.
+      status="no_version"  plugin.json was fetched but has no usable
+                           `version` field.
+      status="error"       transient failure (5xx, network, rate-limit
+                           with no stale copy) — retryable. Caller
+                           should NOT report it as "branch not there".
+    On any non-ok status, version is None; branch is the hint (so the
+    caller knows what we tried) or None when there was no hint.
     """
     candidates: list[str] = [hint_branch] if hint_branch else ["main", "master"]
+    last_status = "not_found"  # if every candidate is missing, that's the verdict
     for b in candidates:
         try:
-            v = _fetch_remote_version(owner, repo, b)
+            text = _conditional_fetch_text(
+                f"https://raw.githubusercontent.com/{owner}/{repo}/{_quote_ref(b)}/plugin.json",
+                key=f"version:{owner}/{repo}@{b}",
+            )
+        except urllib.error.HTTPError as e:
+            last_status = "not_found" if e.code in (404, 410) else "error"
+            continue
+        except Exception:
+            last_status = "error"
+            continue
+        if not text:
+            last_status = "error"  # _conditional_fetch_text returned None for a non-2xx we didn't classify
+            continue
+        try:
+            v = (json.loads(text) or {}).get("version")
         except Exception:
             v = None
-        if v:
-            return v, b
-    return None, (hint_branch or None)
+        if isinstance(v, str) and v:
+            return v, b, "ok"
+        last_status = "no_version"
+    return None, (hint_branch or None), last_status
 
 
 # `_check_one` runs in two modes (see the `bulk` flag below):
@@ -1061,7 +1085,7 @@ def _check_one(name: str, info: dict, bulk: bool = True) -> tuple[str, dict | No
 
     if bulk:
         # ── Bulk pass: version-only, zero api.github.com calls. ──
-        remote_version, branch = _remote_version_any_branch(owner, repo, hint_branch)
+        remote_version, branch, status = _remote_version_any_branch(owner, repo, hint_branch)
         source_updates: dict = {"remote_version": remote_version}
         # Only record a resolved branch when we DIDN'T have a hint —
         # for hint-tracked plugins the marker's branch stays
@@ -1069,25 +1093,37 @@ def _check_one(name: str, info: dict, bulk: bool = True) -> tuple[str, dict | No
         if branch and not hint_branch:
             source_updates["branch"] = branch
         if remote_version is None:
-            if hint_branch:
-                # The marker/git pins this plugin to a specific branch
-                # and that branch's plugin.json couldn't be read (404,
-                # branch renamed/deleted, transient). Don't pretend
-                # it's up to date and don't silently look at main —
-                # `apply_update` would still pull the pinned branch.
-                # Surface the branch name so the user can fix the
-                # marker or push the branch.
+            tried = "main, master" if not hint_branch else f"'{branch}'"
+            if status == "not_found":
+                if hint_branch:
+                    # The marker/git pins this plugin to a branch that
+                    # genuinely isn't on the remote (renamed/deleted).
+                    # `apply_update` would still pull this branch, so
+                    # don't pretend it's up to date and don't silently
+                    # look at main — surface the branch name so the
+                    # user can fix the marker or push the branch.
+                    return name, None, {
+                        "code": "branch_not_on_remote",
+                        "branch": branch,
+                        "message": f"Branch '{branch}' not on {owner}/{repo}",
+                    }, source_updates
+                # No pinned branch and neither main nor master exists —
+                # weird, but treat it as "couldn't reach repo".
                 return name, None, {
-                    "code": "branch_not_on_remote",
-                    "branch": branch,
-                    "message": f"Couldn't read plugin.json on branch '{branch}' of {owner}/{repo}",
+                    "code": "version_unavailable",
+                    "message": f"No main/master branch on {owner}/{repo}",
                 }, source_updates
-            # No pinned branch — we tried main + master and neither
-            # yielded a readable plugin.json. Soft error; the Check
-            # button retry path is the obvious next step.
+            # status == "error" or "no_version": transient / malformed,
+            # NOT "branch missing". Phrase it as retryable so the Check
+            # button is the obvious next step and we don't slander a
+            # perfectly-fine branch as unpublished over a 5xx blip.
             return name, None, {
                 "code": "version_unavailable",
-                "message": f"Couldn't read plugin.json version from {owner}/{repo} (tried main, master)",
+                "message": (
+                    f"Couldn't read plugin.json version from {owner}/{repo} ({tried}) — "
+                    + ("manifest has no version field" if status == "no_version"
+                       else "transient fetch error, retry")
+                ),
             }, source_updates
         if _remote_is_newer(local_version, remote_version):
             return name, {
