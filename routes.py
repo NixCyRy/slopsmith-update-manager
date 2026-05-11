@@ -434,6 +434,20 @@ def _cache_refresh_ttl(key: str, ttl_s: int = _REMOTE_CACHE_TTL_S) -> None:
         _remote_cache_save()
 
 
+def _cache_expire(key: str) -> None:
+    """Mark a cache entry stale so the next read does a conditional
+    refetch (304 → free, 200 → fresh value). The stored ETag is kept,
+    so a force-refresh of unchanged data still costs nothing under the
+    rate limit. Used by the per-plugin Check button to retry a
+    previously-failed registry / source resolution on demand.
+    """
+    cache = _remote_cache_get_dict()
+    entry = cache.get(key)
+    if isinstance(entry, dict):
+        entry["expires_at"] = 0
+        _remote_cache_save()
+
+
 def _conditional_fetch_json(url: str, key: str, ttl_s: int = _REMOTE_CACHE_TTL_S):
     """Fetch JSON with persistent cache + conditional refresh.
 
@@ -710,7 +724,7 @@ def _download_and_replace(owner: str, repo: str, ref: str, target: Path, preserv
             shutil.rmtree(staging, ignore_errors=True)
 
 
-def _resolve_source(plugin_dir: Path) -> dict | None:
+def _resolve_source(plugin_dir: Path, force_registry: bool = False) -> dict | None:
     """Return {'owner','repo','branch','local_sha','local_version','source'} or None.
 
     When BOTH a marker and a .git/ exist (cloned plugin that was later
@@ -741,6 +755,11 @@ def _resolve_source(plugin_dir: Path) -> dict | None:
     Fall back to the existing single-source paths (and finally to
     manifest / registry resolution) when only one or neither is
     available.
+
+    `force_registry=True` re-fetches the slopsmith README registry
+    even if a cached copy is present — used by the per-plugin Check
+    button so a registry fetch that failed on the cold pass can be
+    retried on demand.
     """
     local_version = _read_local_version(plugin_dir)
     marker = _read_marker(plugin_dir)
@@ -840,7 +859,7 @@ def _resolve_source(plugin_dir: Path) -> dict | None:
         except Exception:
             pass
     try:
-        for entry in _registry_cached():
+        for entry in _registry_cached(force=force_registry):
             if entry.get("dirname") == plugin_dir.name:
                 owner, repo = _parse_repo_url(entry.get("url") or "")
                 if owner:
@@ -853,29 +872,150 @@ def _resolve_source(plugin_dir: Path) -> dict | None:
                     }
     except Exception:
         pass
+    #   c) Last-resort heuristic: most slopsmith plugins live at
+    #      github.com/byrongamatos/slopsmith-plugin-<dirname> with the
+    #      dir-name underscores swapped for dashes. Probe that guess via
+    #      raw.githubusercontent.com (no api.github.com call) and accept
+    #      it only if the fetched plugin.json's `id` matches this
+    #      plugin's manifest id — that confirms we found the right repo
+    #      rather than a name collision. Covers plugins not (yet) listed
+    #      in the README's Available Plugins table.
+    local_id = _read_manifest_id(plugin_dir)
+    if local_id:
+        guess_repo = "slopsmith-plugin-" + plugin_dir.name.replace("_", "-")
+        for owner in ("byrongamatos",):
+            for branch in ("main", "master"):
+                try:
+                    text = _conditional_fetch_text(
+                        f"https://raw.githubusercontent.com/{owner}/{guess_repo}/{branch}/plugin.json",
+                        key=f"version:{owner}/{guess_repo}@{branch}",
+                    )
+                except Exception:
+                    text = None
+                if not text:
+                    continue
+                try:
+                    remote_id = (json.loads(text) or {}).get("id")
+                except Exception:
+                    remote_id = None
+                if remote_id == local_id:
+                    return {
+                        "owner": owner, "repo": guess_repo,
+                        "branch": branch,
+                        "local_sha": None,
+                        "local_version": local_version,
+                        "source": "heuristic",
+                    }
     return None
 
 
-# Per-plugin call order is **version-first** to keep the cold-pass
-# cheap on api.github.com's 60/hour anonymous IP rate limit:
+def _read_manifest_id(plugin_dir: Path) -> str | None:
+    """Return the `id` field from a plugin's plugin.json, or None."""
+    manifest = plugin_dir / "plugin.json"
+    if not manifest.exists():
+        return None
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        v = data.get("id") if isinstance(data, dict) else None
+        return v if isinstance(v, str) and v else None
+    except Exception:
+        return None
+
+
+def _version_tuple(v: str | None) -> tuple | None:
+    """Parse a dotted-numeric version string into a comparable tuple.
+
+    "1.8.2" → (1, 8, 2). Returns None if the string doesn't look like
+    a plain numeric semver (e.g. "1.0.0-beta", "v2", "" ) so callers
+    can fall back to string inequality.
+    """
+    if not isinstance(v, str) or not v:
+        return None
+    parts = v.split(".")
+    out = []
+    for p in parts:
+        if not p.isdigit():
+            return None
+        out.append(int(p))
+    return tuple(out) if out else None
+
+
+def _remote_is_newer(local_version: str | None, remote_version: str | None) -> bool:
+    """True iff remote_version is a strictly-newer release than local.
+
+    Numeric-semver comparison when both parse; otherwise (pre-release
+    tags, non-standard schemes, missing values) falls back to plain
+    string inequality so we still surface *a* difference rather than
+    silently hiding a potential update. Never returns True when the
+    local copy is AHEAD of remote (developer on a feature branch with
+    a bumped manifest) — that was a spurious "update available" with
+    the old plain `!=` check.
+    """
+    if not (local_version and remote_version):
+        return False
+    if local_version == remote_version:
+        return False
+    lt, rt = _version_tuple(local_version), _version_tuple(remote_version)
+    if lt is not None and rt is not None:
+        return rt > lt
+    # One or both unparseable — fall back to "they differ" semantics.
+    return True
+
+
+def _remote_version_any_branch(owner: str, repo: str, hint_branch: str | None = None) -> tuple[str | None, str | None]:
+    """Read plugin.json's `version` from the repo, trying branch names
+    in order: the hint (if any), then 'main', then 'master'. Every
+    fetch goes to raw.githubusercontent.com — there are NO api.github.com
+    calls here, so this never consumes the unauthenticated 60/hour API
+    rate limit no matter how many plugins we check.
+
+    Returns (version, branch_that_worked), or (None, None) if no branch
+    yielded a readable plugin.json with a version field.
+    """
+    candidates: list[str] = []
+    if hint_branch:
+        candidates.append(hint_branch)
+    for b in ("main", "master"):
+        if b not in candidates:
+            candidates.append(b)
+    for b in candidates:
+        try:
+            v = _fetch_remote_version(owner, repo, b)
+        except Exception:
+            v = None
+        if v:
+            return v, b
+    return None, None
+
+
+# `_check_one` runs in two modes (see the `bulk` flag below):
 #
-#   1. Fetch plugin.json's `version` from raw.githubusercontent.com
-#      (separate, much higher rate limit — effectively free here).
-#   2. If local_version matches remote_version and we already have
-#      a local_sha, ASSUME up to date — skip the api.github.com
-#      call entirely. The displayed remote_sha == local_sha by
-#      definition in this branch.
-#   3. Only fall back to api.github.com `/repos/.../commits/{branch}`
-#      to fetch the actual remote sha when the version comparison
-#      indicates a possible update or we lack a local_sha to
-#      compare against.
+#   bulk=True  — used by the BULK /updates pass over every plugin.
+#     Makes ZERO api.github.com calls. Resolves the branch by trying
+#     the marker's branch then 'main' then 'master' (all
+#     raw.githubusercontent.com fetches), and detects updates purely
+#     by comparing local plugin.json `version` against the remote
+#     plugin.json `version`. The remote commit SHA is NOT fetched —
+#     it isn't needed for detection, and `apply_update` fetches a
+#     fresh SHA when the user actually clicks Update. This is the
+#     guarantee that the cold first-run pass can never exhaust the
+#     rate-limit budget: a 30-plugin install costs 0 api.github.com
+#     calls, leaving the entire 60/hour budget for on-demand actions.
 #
-# Trade-off: a plugin whose author commits new code without
-# bumping `plugin.json` version is invisible to update detection.
-# We accept that — the manifest version is the user-facing change
-# indicator, and "Versions" picker exposes commit-level history
-# if the user wants to dig deeper.
-def _check_one(name: str, info: dict) -> tuple[str, dict | None, dict | None, dict]:
+#   bulk=False — used by the per-plugin /check/{plugin_id} endpoint.
+#     Does the FULL check: resolves the default branch via
+#     api.github.com if the marker doesn't pin one, fetches the remote
+#     tip SHA, and does SHA-based detection in addition to version
+#     comparison. Costs 1–2 api.github.com calls — affordable because
+#     the bulk pass spent nothing, so the user can always re-check (and
+#     update) any individual external plugin even right after the cold
+#     pass.
+#
+# Trade-off (bulk mode): a plugin whose author commits new code
+# without bumping plugin.json `version` looks "up to date" in the
+# bulk list. The per-plugin Check button (bulk=False) catches that
+# via the SHA comparison, so it's recoverable on demand.
+def _check_one(name: str, info: dict, bulk: bool = True) -> tuple[str, dict | None, dict | None, dict]:
     """Returns (name, result_entry_or_None, error_entry_or_None, source_updates).
 
     Module-level so both the bulk `/updates` parallel pool and the
@@ -883,15 +1023,45 @@ def _check_one(name: str, info: dict) -> tuple[str, dict | None, dict | None, di
     output of `_resolve_source(plugin_dir)`.
     """
     owner, repo = info["owner"], info["repo"]
-    branch = info["branch"] or _default_branch(owner, repo)
-    source_updates = {"branch": branch} if not info["branch"] else {}
     local_sha = info.get("local_sha")
     local_version = info.get("local_version")
+    hint_branch = info.get("branch")  # may be None for marker-less plugins
+
+    if bulk:
+        # ── Bulk pass: version-only, zero api.github.com calls. ──
+        remote_version, branch = _remote_version_any_branch(owner, repo, hint_branch)
+        source_updates: dict = {"remote_version": remote_version}
+        if branch and not hint_branch:
+            source_updates["branch"] = branch
+        if remote_version is None:
+            # Couldn't read a plugin.json version from main/master (or
+            # the marker's branch). Surface a soft error so the row
+            # shows "couldn't reach repo" rather than a misleading
+            # "up to date" — and so the Check button retry path is
+            # the obvious next step.
+            return name, None, {
+                "code": "version_unavailable",
+                "message": f"Couldn't read plugin.json version from {owner}/{repo}",
+            }, source_updates
+        if _remote_is_newer(local_version, remote_version):
+            return name, {
+                "local": (local_sha or "")[:7],
+                "remote": "",  # not fetched in bulk mode — apply_update resolves it
+                "local_version": local_version,
+                "remote_version": remote_version,
+                "branch": branch,
+                "source": info["source"],
+                "repo": f"{owner}/{repo}",
+            }, None, source_updates
+        # Versions equal, local ahead, or no local_version → up to date.
+        return name, None, None, source_updates
+
+    # ── Full check (per-plugin /check endpoint): allowed to spend
+    #    api.github.com calls. ──
+    branch = hint_branch or _default_branch(owner, repo)
+    source_updates = {"branch": branch} if not hint_branch else {}
 
     # Step 1: cheap version probe via raw.githubusercontent.com.
-    # We only attempt it if we have a local_version to compare
-    # against; otherwise the result wouldn't help us short-circuit
-    # the api.github.com call below.
     remote_version = None
     if local_version:
         try:
@@ -946,7 +1116,7 @@ def _check_one(name: str, info: dict) -> tuple[str, dict | None, dict | None, di
         source_updates["remote_version"] = remote_version
 
     sha_update = local_sha and remote_sha and remote_sha != local_sha
-    ver_update = (not local_sha) and local_version and remote_version and remote_version != local_version
+    ver_update = (not local_sha) and _remote_is_newer(local_version, remote_version)
     if sha_update or ver_update:
         return name, {
             "local": (local_sha or "")[:7],
@@ -965,10 +1135,19 @@ def _check_one(name: str, info: dict) -> tuple[str, dict | None, dict | None, di
 # (304 responses don't count against the rate limit). Parsing happens
 # every time we hit the cache because the parsed dict isn't itself
 # cached — but that's a few µs of regex work, dwarfed by network cost.
-def _registry_cached() -> list[dict]:
+_REGISTRY_CACHE_KEY = "registry:slopsmith-readme"
+
+
+def _registry_cached(force: bool = False) -> list[dict]:
+    if force:
+        # Drop to a stale state so the next fetch does a conditional
+        # GET. Recovers from a registry fetch that failed on the cold
+        # pass (network blip, transient 5xx) — the per-plugin Check
+        # button passes force=True so the user can retry resolution.
+        _cache_expire(_REGISTRY_CACHE_KEY)
     try:
         md = _conditional_fetch_text(
-            REGISTRY_URL, key="registry:slopsmith-readme", ttl_s=_VERSIONS_CACHE_TTL_S,
+            REGISTRY_URL, key=_REGISTRY_CACHE_KEY, ttl_s=_VERSIONS_CACHE_TTL_S,
         )
     except Exception:
         md = None
@@ -1270,14 +1449,26 @@ def setup(app, context):
 
     @app.get("/api/plugins/update_manager/check/{plugin_id}")
     def check_one_plugin(plugin_id: str):
-        """Recheck a single plugin against GitHub on demand.
+        """Recheck a single external plugin against GitHub on demand.
 
-        Mirrors one slice of the bulk `/updates` response so the frontend
-        can merge the result into its local `updates / errors / sources`
-        dicts without re-running the whole batch. Useful when the bulk
-        cold pass exhausted GitHub's anonymous IP rate limit and left
-        some rows in "Check failed" — the user can wait for the quota
-        window and retry just the failed ones.
+        Always available for any non-bundled plugin (the UI's per-row
+        "Check" button is never gated away). Unlike the bulk `/updates`
+        pass — which is deliberately api.github.com-free so the cold
+        first run can't exhaust the rate limit — this does the FULL
+        check (resolves the default branch, fetches the remote tip SHA)
+        because it's a single plugin and the whole 60/hour budget is
+        available for these on-demand actions.
+
+        If the bulk pass couldn't resolve a source for this plugin
+        (e.g. the slopsmith README registry fetch failed on the cold
+        pass), we force-refresh the registry here and retry resolution
+        so the user is never permanently stuck with an unresolvable
+        external plugin.
+
+        Mirrors one slice of the bulk `/updates` response so the
+        frontend can merge the result into its local
+        `updates / errors / sources` dicts without re-running the
+        whole batch.
         """
         if not SLUG_RE.match(plugin_id):
             return {"error": "Invalid plugin id"}
@@ -1297,6 +1488,11 @@ def setup(app, context):
             source = {"bundled": True}
         else:
             info = _resolve_source(p)
+            if not (info and info["owner"]):
+                # First resolution attempt found nothing — retry with a
+                # forced registry refresh in case the cold-pass fetch
+                # failed transiently.
+                info = _resolve_source(p, force_registry=True)
             if info and info["owner"]:
                 source = {
                     "repo": f"{info['owner']}/{info['repo']}",
@@ -1308,9 +1504,24 @@ def setup(app, context):
 
         result_entry = None
         error_entry = None
-        if not bundled and plugin_id not in excluded_set and info:
-            _, result_entry, error_entry, source_updates = _check_one(plugin_id, info)
+        if bundled:
+            pass  # bundled plugins are managed by core; nothing to check
+        elif plugin_id in excluded_set:
+            pass  # excluded — just re-sync the excluded/bundled flags
+        elif info:
+            # Full check (bulk=False) — allowed to spend api.github.com calls.
+            _, result_entry, error_entry, source_updates = _check_one(plugin_id, info, bulk=False)
             source.update(source_updates)
+        else:
+            error_entry = {
+                "code": "source_unresolved",
+                "message": (
+                    "Couldn't determine this plugin's GitHub repo — no install marker, "
+                    "no .git/, not listed in the slopsmith plugin registry, and the "
+                    "byrongamatos/slopsmith-plugin-<dir> heuristic didn't match. "
+                    "Re-install it via the Browse tab to record its source."
+                ),
+            }
 
         return {
             "plugin_id": plugin_id,
