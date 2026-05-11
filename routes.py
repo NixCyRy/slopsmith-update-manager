@@ -923,15 +923,32 @@ def _read_manifest_id(plugin_dir: Path) -> str | None:
 
 
 def _version_tuple(v: str | None) -> tuple | None:
-    """Parse a dotted-numeric version string into a comparable tuple.
+    """Parse a version string into a comparable numeric tuple.
 
-    "1.8.2" → (1, 8, 2). Returns None if the string doesn't look like
-    a plain numeric semver (e.g. "1.0.0-beta", "v2", "" ) so callers
-    can fall back to string inequality.
+    Handles the common shapes:
+      "1.8.2"          → (1, 8, 2)
+      "v1.8.2"         → (1, 8, 2)        leading v/V stripped
+      "1.0.0-beta2"    → (1, 0, 0)        pre-release/build suffix dropped
+      "1.0.0+build.7"  → (1, 0, 0)        (so a beta and its release compare
+                                           equal — we'd miss the beta→release
+                                           bump in the bulk pass but the
+                                           per-plugin Check still catches it)
+
+    Returns None only when the numeric core still doesn't parse (e.g.
+    "rolling", "" , "2024-01"), so callers fall back to string
+    inequality for genuinely non-numeric schemes.
     """
     if not isinstance(v, str) or not v:
         return None
-    parts = v.split(".")
+    s = v.strip()
+    if s[:1] in ("v", "V"):
+        s = s[1:]
+    # Drop a pre-release ("-beta2") or build ("+sha") suffix; keep the
+    # dotted-numeric core that precedes it.
+    for sep in ("-", "+"):
+        if sep in s:
+            s = s.split(sep, 1)[0]
+    parts = s.split(".")
     out = []
     for p in parts:
         if not p.isdigit():
@@ -943,13 +960,14 @@ def _version_tuple(v: str | None) -> tuple | None:
 def _remote_is_newer(local_version: str | None, remote_version: str | None) -> bool:
     """True iff remote_version is a strictly-newer release than local.
 
-    Numeric-semver comparison when both parse; otherwise (pre-release
-    tags, non-standard schemes, missing values) falls back to plain
-    string inequality so we still surface *a* difference rather than
-    silently hiding a potential update. Never returns True when the
-    local copy is AHEAD of remote (developer on a feature branch with
-    a bumped manifest) — that was a spurious "update available" with
-    the old plain `!=` check.
+    Numeric comparison when both `_version_tuple()`-parse (covers
+    plain "X.Y.Z", "vX.Y.Z", and pre-release/build-tagged forms via
+    suffix-stripping). When a side genuinely won't parse as numeric,
+    we DON'T flag an update — a false negative is recoverable on
+    demand via the per-plugin Check button (which does SHA-based
+    detection), whereas a false positive ("update available" pointing
+    at an older or sideways version) is annoying and can lead to a
+    failed Update. So when in doubt: stay quiet.
     """
     if not (local_version and remote_version):
         return False
@@ -958,26 +976,37 @@ def _remote_is_newer(local_version: str | None, remote_version: str | None) -> b
     lt, rt = _version_tuple(local_version), _version_tuple(remote_version)
     if lt is not None and rt is not None:
         return rt > lt
-    # One or both unparseable — fall back to "they differ" semantics.
-    return True
+    # Non-numeric scheme on at least one side — can't reliably order
+    # them, so don't flag. The per-plugin Check button will catch a
+    # real update via the SHA comparison.
+    return False
 
 
 def _remote_version_any_branch(owner: str, repo: str, hint_branch: str | None = None) -> tuple[str | None, str | None]:
-    """Read plugin.json's `version` from the repo, trying branch names
-    in order: the hint (if any), then 'main', then 'master'. Every
-    fetch goes to raw.githubusercontent.com — there are NO api.github.com
-    calls here, so this never consumes the unauthenticated 60/hour API
-    rate limit no matter how many plugins we check.
+    """Read plugin.json's `version` from the repo via raw.githubusercontent.com.
 
-    Returns (version, branch_that_worked), or (None, None) if no branch
-    yielded a readable plugin.json with a version field.
+    Branch selection:
+      - hint_branch given (a marker/git-tracked plugin): use ONLY that
+        branch. Don't silently fall back to main/master — the tracked
+        branch IS the source of truth, and `apply_update` will pull
+        from it; falling back here would report an update against a
+        branch the Update flow won't actually use. A 404 on the hint
+        branch ⇒ (None, hint_branch) so the caller can surface a
+        "branch not on remote" error against the right branch name.
+      - hint_branch absent (a registry/heuristic/manifest-resolved
+        plugin where we don't actually know the branch): try 'main'
+        then 'master'.
+
+    Every fetch goes to raw.githubusercontent.com — there are NO
+    api.github.com calls here, so this never consumes the
+    unauthenticated 60/hour API rate limit no matter how many plugins
+    we check.
+
+    Returns (version, branch_that_worked) on success; on failure
+    returns (None, hint_branch) when a hint was given (so the caller
+    knows which branch we tried), else (None, None).
     """
-    candidates: list[str] = []
-    if hint_branch:
-        candidates.append(hint_branch)
-    for b in ("main", "master"):
-        if b not in candidates:
-            candidates.append(b)
+    candidates: list[str] = [hint_branch] if hint_branch else ["main", "master"]
     for b in candidates:
         try:
             v = _fetch_remote_version(owner, repo, b)
@@ -985,22 +1014,25 @@ def _remote_version_any_branch(owner: str, repo: str, hint_branch: str | None = 
             v = None
         if v:
             return v, b
-    return None, None
+    return None, (hint_branch or None)
 
 
 # `_check_one` runs in two modes (see the `bulk` flag below):
 #
 #   bulk=True  — used by the BULK /updates pass over every plugin.
-#     Makes ZERO api.github.com calls. Resolves the branch by trying
-#     the marker's branch then 'main' then 'master' (all
-#     raw.githubusercontent.com fetches), and detects updates purely
-#     by comparing local plugin.json `version` against the remote
-#     plugin.json `version`. The remote commit SHA is NOT fetched —
-#     it isn't needed for detection, and `apply_update` fetches a
-#     fresh SHA when the user actually clicks Update. This is the
-#     guarantee that the cold first-run pass can never exhaust the
-#     rate-limit budget: a 30-plugin install costs 0 api.github.com
-#     calls, leaving the entire 60/hour budget for on-demand actions.
+#     Makes ZERO api.github.com calls. Branch selection: a
+#     marker/git-tracked plugin uses ONLY its tracked branch (the
+#     source of truth `apply_update` will pull from); a plugin with
+#     no tracked branch (registry/heuristic-resolved) tries 'main'
+#     then 'master'. All branch probes go to raw.githubusercontent.com.
+#     Updates are detected purely by comparing local plugin.json
+#     `version` against the remote `version` (semver-aware via
+#     `_remote_is_newer`). The remote commit SHA is NOT fetched — it
+#     isn't needed for detection, and `apply_update` fetches a fresh
+#     SHA when the user actually clicks Update. This is the guarantee
+#     that the cold first-run pass can never exhaust the rate-limit
+#     budget: a 30-plugin install costs 0 api.github.com calls,
+#     leaving the entire 60/hour budget for on-demand actions.
 #
 #   bulk=False — used by the per-plugin /check/{plugin_id} endpoint.
 #     Does the FULL check: resolves the default branch via
@@ -1031,17 +1063,31 @@ def _check_one(name: str, info: dict, bulk: bool = True) -> tuple[str, dict | No
         # ── Bulk pass: version-only, zero api.github.com calls. ──
         remote_version, branch = _remote_version_any_branch(owner, repo, hint_branch)
         source_updates: dict = {"remote_version": remote_version}
+        # Only record a resolved branch when we DIDN'T have a hint —
+        # for hint-tracked plugins the marker's branch stays
+        # authoritative (we never fall back off it in bulk mode).
         if branch and not hint_branch:
             source_updates["branch"] = branch
         if remote_version is None:
-            # Couldn't read a plugin.json version from main/master (or
-            # the marker's branch). Surface a soft error so the row
-            # shows "couldn't reach repo" rather than a misleading
-            # "up to date" — and so the Check button retry path is
-            # the obvious next step.
+            if hint_branch:
+                # The marker/git pins this plugin to a specific branch
+                # and that branch's plugin.json couldn't be read (404,
+                # branch renamed/deleted, transient). Don't pretend
+                # it's up to date and don't silently look at main —
+                # `apply_update` would still pull the pinned branch.
+                # Surface the branch name so the user can fix the
+                # marker or push the branch.
+                return name, None, {
+                    "code": "branch_not_on_remote",
+                    "branch": branch,
+                    "message": f"Couldn't read plugin.json on branch '{branch}' of {owner}/{repo}",
+                }, source_updates
+            # No pinned branch — we tried main + master and neither
+            # yielded a readable plugin.json. Soft error; the Check
+            # button retry path is the obvious next step.
             return name, None, {
                 "code": "version_unavailable",
-                "message": f"Couldn't read plugin.json version from {owner}/{repo}",
+                "message": f"Couldn't read plugin.json version from {owner}/{repo} (tried main, master)",
             }, source_updates
         if _remote_is_newer(local_version, remote_version):
             return name, {
