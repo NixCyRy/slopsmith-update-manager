@@ -1,5 +1,4 @@
-"""Update Manager - installs, updates, and restarts slopsmith plugins
-and the slopsmith core itself via GitHub zip downloads.
+"""Update Manager - installs and updates slopsmith plugins via GitHub zip downloads.
 
 No `git` CLI needed (the slopsmith container ships without it). State for
 installed plugins is tracked in a `.slopsmith-installed.json` marker inside
@@ -8,7 +7,6 @@ each plugin directory. For plugins that were installed via host-side
 to infer origin and local commit.
 """
 
-import fnmatch
 import io
 import json
 import os
@@ -35,14 +33,6 @@ PLUGINS_DIR = Path(__file__).resolve().parent.parent
 CACHE_DIR = Path(os.environ.get("CONFIG_DIR", "/config")) / "update_manager"
 EXCL_FILE = CACHE_DIR / "exclusions.json"
 
-CORE_REPO_OWNER = "byrongamatos"
-CORE_REPO_NAME = "slopsmith"
-CORE_MOUNTED_PATHS = {"server.py", "ug_browser.py", "lib", "static"}
-CORE_IGNORED_PATHS = {"plugins", "*.md", "docs", "tests", ".claude"}
-CORE_MARKER_FILE = CACHE_DIR / "core.json"
-CORE_EXCLUSION_KEY = "__core__"
-APP_ROOT = Path("/app")
-REBUILD_CMD = "cd slopsmith && git pull && docker compose build web && docker compose up -d"
 SELF_UPDATE_STAGING = CACHE_DIR / "self_update"
 
 
@@ -146,6 +136,24 @@ def _installed_plugin_dirs() -> dict[str, Path]:
             pass
         out[pid] = p
     return out
+
+
+def _is_bundled(plugin_dir: Path) -> bool:
+    """Return True if the plugin's manifest declares `bundled: true`.
+
+    Bundled plugins ship in-tree with the slopsmith container image
+    (slopsmith#160). They aren't `git clone`-installed and don't carry
+    a marker file or `.git/`. Updates and uninstalls are handled by
+    slopsmith core, not by this plugin.
+    """
+    manifest = plugin_dir / "plugin.json"
+    if not manifest.exists():
+        return False
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        return bool(isinstance(data, dict) and data.get("bundled") is True)
+    except Exception:
+        return False
 
 
 def _read_marker(plugin_dir: Path) -> dict | None:
@@ -287,114 +295,6 @@ def _resolve_source(plugin_dir: Path) -> dict | None:
     return None
 
 
-def _load_core_marker() -> dict | None:
-    if not CORE_MARKER_FILE.exists():
-        return None
-    try:
-        return json.loads(CORE_MARKER_FILE.read_text())
-    except Exception:
-        return None
-
-
-def _save_core_marker(sha: str, branch: str) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    CORE_MARKER_FILE.write_text(json.dumps({
-        "repo": f"{CORE_REPO_OWNER}/{CORE_REPO_NAME}",
-        "url": f"https://github.com/{CORE_REPO_OWNER}/{CORE_REPO_NAME}",
-        "branch": branch,
-        "sha": sha,
-        "installed_at": int(time.time()),
-    }, indent=2))
-
-
-def _core_changed_files(local_sha: str, remote_sha: str) -> list[dict]:
-    """GitHub compare API. Returns [{filename, status}, ...]."""
-    url = (
-        f"https://api.github.com/repos/{CORE_REPO_OWNER}/{CORE_REPO_NAME}"
-        f"/compare/{local_sha}...{remote_sha}"
-    )
-    data = _http_json(url)
-    files = data.get("files") or []
-    return [{"filename": f.get("filename", ""), "status": f.get("status", "")} for f in files]
-
-
-def _is_ignored(path: str) -> bool:
-    """Check if path matches any pattern in CORE_IGNORED_PATHS, supporting fnmatch wildcards."""
-    top = path.split("/", 1)[0]
-    for pattern in CORE_IGNORED_PATHS:
-        if fnmatch.fnmatch(top, pattern):
-            return True
-    return False
-
-
-def _classify_core_changes(files: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Split changed files into (writable_to_mount, blockers).
-
-    Files under CORE_IGNORED_PATHS are omitted from both lists (plugins/
-    is managed separately; touching it here would clobber user installs).
-    """
-    writable, blockers = [], []
-    for f in files:
-        name = f.get("filename", "")
-        if not name:
-            continue
-        if _is_ignored(name):
-            continue
-        top = name.split("/", 1)[0]
-        if top in CORE_MOUNTED_PATHS:
-            writable.append(f)
-        else:
-            blockers.append(f)
-    return writable, blockers
-
-
-def _download_core_stage(branch: str) -> tuple[Path, str]:
-    """Download the core repo zip, extract to a tempdir, return (stage_root, prefix)."""
-    url = f"https://codeload.github.com/{CORE_REPO_OWNER}/{CORE_REPO_NAME}/zip/refs/heads/{branch}"
-    data = _http_get(url, timeout=180)
-    zf = zipfile.ZipFile(io.BytesIO(data))
-    members = [m for m in zf.namelist() if not m.endswith("/")]
-    if not members:
-        raise RuntimeError("Empty core archive")
-    prefix = members[0].split("/")[0] + "/"
-    stage = Path(tempfile.mkdtemp(prefix="slopsmith-core-"))
-    for m in members:
-        if not m.startswith(prefix):
-            continue
-        rel = m[len(prefix):]
-        if not rel or ".." in Path(rel).parts:
-            continue
-        if _is_ignored(rel):
-            continue
-        top = rel.split("/", 1)[0]
-        if top not in CORE_MOUNTED_PATHS:
-            continue
-        out = stage / rel
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_bytes(zf.read(m))
-    return stage, prefix
-
-
-def _overlay_core(stage: Path) -> list[str]:
-    """Non-destructive copy from stage into APP_ROOT.
-
-    For every file under the staged mount-whitelist tree, write it into
-    the matching location under /app, creating parent dirs as needed.
-    Never delete existing files that are absent from the stage — this
-    preserves runtime artifacts (e.g. static/audio_*.mp3, __pycache__/).
-    Returns the list of relative paths written.
-    """
-    written: list[str] = []
-    for src in stage.rglob("*"):
-        if not src.is_file():
-            continue
-        rel = src.relative_to(stage)
-        dst = APP_ROOT / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(src), str(dst))
-        written.append(str(rel).replace("\\", "/"))
-    return written
-
 
 def _self_update(owner: str, repo: str, branch: str, sha: str) -> dict:
     """Download new version to staging and mark for pending restart.
@@ -467,10 +367,18 @@ def setup(app, context):
         except Exception as e:
             return {"error": f"Failed to fetch registry: {e}"}
         entries = _parse_registry(md)
-        installed_dirs = {p.name for p in _installed_plugin_dirs().values()}
+        installed = _installed_plugin_dirs()
+        installed_dirs = {p.name for p in installed.values()}
+        bundled_dirs = {p.name for p in installed.values() if _is_bundled(p)}
         for e in entries:
             e["installed"] = e["dirname"] in installed_dirs
-        return {"count": len(entries), "entries": entries}
+            # Surface dirname-collision with a bundled plugin so the UI
+            # can prompt before installing an override. Doesn't catch the
+            # case where the registry entry's install command targets a
+            # different directory than the bundled one — that requires
+            # an `upstream` annotation that isn't standardised yet.
+            e["overrides_bundled"] = e["dirname"] in bundled_dirs
+        return {"count": len(entries), "entries": entries, "bundled_dirs": sorted(bundled_dirs)}
 
     @app.post("/api/plugins/update_manager/install")
     async def install(body: dict):
@@ -509,8 +417,18 @@ def setup(app, context):
         results = {}
         errors = {}
         sources = {}
+        bundled = []
         excluded = _load_exclusions()
         for name, p in _installed_plugin_dirs().items():
+            if _is_bundled(p):
+                bundled.append(name)
+                # Bundled plugins are managed by slopsmith core: no marker,
+                # no .git/, no remote to compare against. Surface them in
+                # sources[] so the UI can render a "Bundled" badge instead
+                # of leaving them invisible — but skip the rest of the
+                # update-detection loop.
+                sources[name] = {"bundled": True}
+                continue
             info = _resolve_source(p)
             if info and info["owner"]:
                 sources[name] = {
@@ -551,7 +469,13 @@ def setup(app, context):
                     "source": info["source"],
                     "repo": f"{owner}/{repo}",
                 }
-        return {"updates": results, "errors": errors, "excluded": sorted(excluded), "sources": sources}
+        return {
+            "updates": results,
+            "errors": errors,
+            "excluded": sorted(excluded),
+            "sources": sources,
+            "bundled": sorted(bundled),
+        }
 
     @app.get("/api/plugins/update_manager/exclusions")
     def get_exclusions():
@@ -561,7 +485,7 @@ def setup(app, context):
     async def set_exclusion(body: dict):
         plugin_id = (body.get("plugin_id") or "").strip()
         exclude = bool(body.get("excluded"))
-        if plugin_id != CORE_EXCLUSION_KEY and not SLUG_RE.match(plugin_id):
+        if not SLUG_RE.match(plugin_id):
             return {"error": "Invalid plugin id"}
         excl = _load_exclusions()
         if exclude:
@@ -580,6 +504,11 @@ def setup(app, context):
         target = _installed_plugin_dirs().get(plugin_id)
         if not target or not target.is_dir():
             return {"error": "Plugin not found"}
+        if _is_bundled(target):
+            return {
+                "error": "Bundled with slopsmith core; updates ship with the slopsmith app itself.",
+                "bundled": True,
+            }
         info = _resolve_source(target)
         if not info:
             return {"error": "Plugin source unknown (no marker, no .git/config)"}
@@ -599,18 +528,26 @@ def setup(app, context):
         except Exception as e:
             return {"error": str(e)}
 
-    @app.post("/api/plugins/update_manager/restart")
-    def restart_server():
-        """Restart the uvicorn process in-place via os.execv.
+    @app.get("/api/plugins/update_manager/config")
+    def get_config():
+        is_desktop = os.environ.get("SLOPSMITH_DESKTOP", "").lower() in ("1", "true", "yes")
+        return {"is_desktop": is_desktop}
 
-        Replaces the current Python process image with a fresh uvicorn,
-        same PID. Parent shell (PID 1) sees no child exit, so the
-        container stays alive. No docker-compose restart policy needed.
+    @app.post("/api/plugins/update_manager/restart")
+    async def restart_server(body: dict = None):
+        """Apply any pending self-update, then restart.
+
+        With apply_only=true (sent by desktop clients): apply staged files
+        and return — the desktop app handles the actual process restart.
+        Without it: re-exec uvicorn in-place via os.execv (container path).
         """
+        apply_only = bool((body or {}).get("apply_only"))
+
         plugin_target = PLUGINS_DIR / "update_manager"
-        if _apply_pending_self_update(plugin_target):
-            marker = SELF_UPDATE_STAGING / ".self_update_pending"
-            marker.unlink(missing_ok=True)
+        _apply_pending_self_update(plugin_target)
+
+        if apply_only:
+            return {"ok": True}
 
         # Snapshot the original argv before returning (after exec, this
         # function never runs to completion).
@@ -642,123 +579,6 @@ def setup(app, context):
         threading.Thread(target=_do_exec, daemon=True).start()
         return {"ok": True, "argv": argv}
 
-    @app.get("/api/plugins/update_manager/core")
-    def core_status():
-        marker = _load_core_marker()
-        excluded = CORE_EXCLUSION_KEY in _load_exclusions()
-        try:
-            branch = (marker or {}).get("branch") or _default_branch(CORE_REPO_OWNER, CORE_REPO_NAME)
-        except Exception:
-            branch = "main"
-        resp: dict = {
-            "repo": f"{CORE_REPO_OWNER}/{CORE_REPO_NAME}",
-            "url": f"https://github.com/{CORE_REPO_OWNER}/{CORE_REPO_NAME}",
-            "branch": branch,
-            "tracking": marker is not None,
-            "local_sha": (marker or {}).get("sha"),
-            "excluded": excluded,
-        }
-        try:
-            remote_sha = _latest_sha(CORE_REPO_OWNER, CORE_REPO_NAME, branch)
-        except Exception as e:
-            resp["error"] = f"Failed to check remote: {e}"
-            return resp
-        resp["remote_sha"] = remote_sha
-        if not marker or not marker.get("sha"):
-            resp["behind"] = False
-            return resp
-        local_sha = marker["sha"]
-        if local_sha == remote_sha:
-            resp["behind"] = False
-            resp["changed_files"] = []
-            resp["blockers"] = []
-            return resp
-        try:
-            changed = _core_changed_files(local_sha, remote_sha)
-        except Exception as e:
-            resp["behind"] = True
-            resp["changed_files"] = []
-            resp["blockers"] = []
-            resp["compare_error"] = str(e)
-            return resp
-        writable, blockers = _classify_core_changes(changed)
-        resp["behind"] = True
-        resp["changed_files"] = writable + blockers
-        resp["blockers"] = blockers
-        resp["rebuild_required"] = bool(blockers)
-        resp["rebuild_command"] = REBUILD_CMD if blockers else None
-        return resp
-
-    @app.post("/api/plugins/update_manager/core/init")
-    async def core_init(body: dict):
-        sha = ((body or {}).get("sha") or "").strip() if isinstance(body, dict) else ""
-        try:
-            branch = _default_branch(CORE_REPO_OWNER, CORE_REPO_NAME)
-            if not sha:
-                sha = _latest_sha(CORE_REPO_OWNER, CORE_REPO_NAME, branch) or ""
-            if not sha:
-                return {"error": "Could not resolve SHA"}
-            _save_core_marker(sha, branch)
-            return {"ok": True, "sha": sha[:7], "branch": branch}
-        except urllib.error.HTTPError as e:
-            return {"error": f"HTTP {e.code}: {e.reason}"}
-        except Exception as e:
-            return {"error": str(e)}
-
-    @app.post("/api/plugins/update_manager/core/update")
-    def core_update():
-        if CORE_EXCLUSION_KEY in _load_exclusions():
-            return {"error": "Core is excluded from updates"}
-        marker = _load_core_marker()
-        if not marker or not marker.get("sha"):
-            return {"error": "Core tracking not initialized. Click 'Initialize tracking' first."}
-        branch = marker.get("branch") or _default_branch(CORE_REPO_OWNER, CORE_REPO_NAME)
-        try:
-            remote_sha = _latest_sha(CORE_REPO_OWNER, CORE_REPO_NAME, branch)
-        except urllib.error.HTTPError as e:
-            return {"error": f"HTTP {e.code}: {e.reason}"}
-        except Exception as e:
-            return {"error": str(e)}
-        if not remote_sha:
-            return {"error": "Could not resolve latest commit"}
-        if remote_sha == marker["sha"]:
-            return {"ok": True, "sha": remote_sha[:7], "branch": branch, "written_files": [], "unchanged": True}
-        try:
-            changed = _core_changed_files(marker["sha"], remote_sha)
-        except Exception as e:
-            return {"error": f"Compare failed: {e}"}
-        writable, blockers = _classify_core_changes(changed)
-        if blockers:
-            return {
-                "error": "rebuild_required",
-                "message": "Remote commits touch files that aren't bind-mounted. Rebuild the container.",
-                "blockers": blockers,
-                "command": REBUILD_CMD,
-                "branch": branch,
-                "remote_sha": remote_sha[:7],
-            }
-        if not writable:
-            _save_core_marker(remote_sha, branch)
-            return {"ok": True, "sha": remote_sha[:7], "branch": branch, "written_files": []}
-        stage = None
-        try:
-            stage, _ = _download_core_stage(branch)
-            written = _overlay_core(stage)
-            _save_core_marker(remote_sha, branch)
-            return {
-                "ok": True,
-                "sha": remote_sha[:7],
-                "branch": branch,
-                "written_files": written,
-            }
-        except urllib.error.HTTPError as e:
-            return {"error": f"HTTP {e.code}: {e.reason}"}
-        except Exception as e:
-            return {"error": str(e)}
-        finally:
-            if stage and stage.exists():
-                shutil.rmtree(stage, ignore_errors=True)
-
     @app.post("/api/plugins/update_manager/uninstall/{plugin_id}")
     def uninstall(plugin_id: str):
         if not SLUG_RE.match(plugin_id):
@@ -768,6 +588,11 @@ def setup(app, context):
         target = _installed_plugin_dirs().get(plugin_id)
         if not target or not target.is_dir():
             return {"error": "Plugin not found"}
+        if _is_bundled(target):
+            return {
+                "error": "Bundled with slopsmith core; cannot be uninstalled. Install a standalone copy under a different directory to override.",
+                "bundled": True,
+            }
         try:
             shutil.rmtree(target)
             return {"ok": True}
