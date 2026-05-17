@@ -1,10 +1,9 @@
-/* Update Manager - install + update plugins and slopsmith core over GitHub */
+/* Update Manager - install + update plugins via GitHub zip downloads */
 (function () {
     const RESTART_KEY = 'update_manager:restartPending';
     const PENDING_IDS_KEY = 'update_manager:pendingRestartIds';
     const START_TIME_KEY = 'update_manager:knownStartTime';
     const API = '/api/plugins/update_manager';
-    const CORE_KEY = '__core__';
 
     let plugins = [];        // /api/plugins result (installed list)
     let updates = {};        // API + '/updates' -> { [id]: {local, remote, branch, source, repo} }
@@ -13,7 +12,6 @@
     let excluded = new Set(); // plugin ids the user has opted out of updates for
     let bundledIds = new Set(); // plugin ids that ship with slopsmith core (issue #1)
     let registry = [];       // API + '/registry' -> entries
-    let coreStatus = null;   // API + '/core'
     let currentTab = 'updates';
     let isDesktop = !!window.slopsmithDesktop?.isDesktop;
     let _inflightChecks = new Set(); // plugin ids with an in-flight per-row recheck
@@ -101,9 +99,8 @@
 
     // Refresh the "N updates available" status text and Update-all
     // button visibility from current state. Called after any flow that
-    // mutates `updates` / `excluded` / `coreStatus`. Centralised so the
-    // counter rules don't drift between bulk check, exclusion toggle,
-    // and per-row recheck.
+    // mutates `updates` / `excluded`. Centralised so the counter rules
+    // don't drift between bulk check, exclusion toggle, and per-row recheck.
     function updaterRefreshStatusUI() {
         // Pending-restart ids are functionally up-to-date locally —
         // their new code is staged on disk; only the running process
@@ -111,17 +108,14 @@
         // Update-all for them, don't let updaterUpdateAll re-pick
         // them on the next pass.
         const pluginCount = Object.keys(updates).filter(id => !_pendingRestart.has(id)).length;
-        const coreBehind = !!(coreStatus && coreStatus.behind && !coreStatus.excluded);
-        const total = pluginCount + (coreBehind ? 1 : 0);
         const statusEl = document.getElementById('updater-status');
         if (statusEl) {
-            statusEl.textContent = total === 0
+            statusEl.textContent = pluginCount === 0
                 ? 'Everything up to date.'
-                : total + ' update' + (total > 1 ? 's' : '') + ' available';
+                : pluginCount + ' update' + (pluginCount > 1 ? 's' : '') + ' available';
         }
-        const coreUpdatable = coreBehind && !coreStatus.rebuild_required;
         const allBtn = document.getElementById('updater-update-all-btn');
-        if (allBtn) allBtn.classList.toggle('hidden', pluginCount === 0 && !coreUpdatable);
+        if (allBtn) allBtn.classList.toggle('hidden', pluginCount === 0);
     }
 
     // ── Screen show hook ───────────────────────────────────────────────
@@ -189,15 +183,10 @@
         status.textContent = '';
         table.innerHTML = '';
         try {
-            // Run start-time sync in parallel with the three data
-            // fetches. Awaited before the pending-id strip below
-            // so the freshly-fetched `updates` is filtered against
-            // the post-clear pending set.
             const syncP = syncProcessStartTime();
-            const [pRes, uRes, cRes] = await Promise.all([
+            const [pRes, uRes] = await Promise.all([
                 fetch('/api/plugins'),
                 fetch(API + '/updates'),
-                fetch(API + '/core'),
             ]);
             plugins = await pRes.json();
             const uData = await uRes.json();
@@ -206,19 +195,11 @@
             sources = uData.sources || {};
             excluded = new Set(uData.excluded || []);
             bundledIds = new Set(uData.bundled || []);
-            coreStatus = await cRes.json();
             await syncP;
-            // Strip pending-restart ids from `updates` so the backend
-            // can't re-introduce them between Update click and
-            // restart. The marker write at update time may not yet
-            // reflect on the GitHub-cached side, and we don't want
-            // to revert the row's pending-restart UI just because
-            // the bulk recheck still sees mismatched shas.
             for (const id of _pendingRestart) {
                 delete updates[id];
                 delete updateErrors[id];
             }
-            updaterRenderCore();
             updaterRenderUpdates();
             document.getElementById('updater-last-checked').textContent =
                 'Last checked: ' + new Date().toLocaleTimeString();
@@ -231,198 +212,6 @@
             loading.classList.add('hidden');
         }
     };
-
-    // ── Core card ──────────────────────────────────────────────────────
-    function updaterRenderCore() {
-        const card = document.getElementById('updater-core-card');
-        const rebuildBanner = document.getElementById('updater-rebuild-banner');
-        const rebuildCmdEl = document.getElementById('updater-rebuild-cmd');
-        const rebuildFilesEl = document.getElementById('updater-rebuild-files');
-        if (!card) return;
-        if (!coreStatus || coreStatus.hidden) {
-            card.classList.add('hidden');
-            if (rebuildBanner) rebuildBanner.classList.add('hidden');
-            return;
-        }
-
-        const c = coreStatus;
-        card.classList.remove('hidden');
-
-        let statusHtml, actionHtml, localStr = '', remoteStr = '', rowBg;
-
-        if (c.error) {
-            rowBg = 'bg-dark-800/30';
-            statusHtml = `<span class="text-red-400 text-xs" title="${esc(c.error)}">Check failed</span>`;
-            actionHtml = `<button onclick="updaterCheck()" class="text-gray-400 hover:text-white text-xs transition">Retry</button>`;
-        } else if (!c.tracking) {
-            rowBg = 'bg-dark-800/30';
-            statusHtml = `<span class="text-gray-400 font-semibold text-xs">Tracking not initialized</span>
-                <div class="text-[10px] text-gray-600 mt-0.5">Stamp the current commit to enable update checks</div>`;
-            actionHtml = `<button onclick="updaterInitCore(this)"
-                class="bg-accent/20 hover:bg-accent/30 text-accent px-3 py-1 rounded-lg text-xs transition">Initialize tracking</button>`;
-            remoteStr = (c.remote_sha || '').slice(0, 7);
-        } else if (c.excluded) {
-            rowBg = 'bg-dark-900/40 opacity-60';
-            localStr = (c.local_sha || '').slice(0, 7);
-            remoteStr = (c.remote_sha || '').slice(0, 7);
-            statusHtml = `<span class="text-gray-500 font-semibold text-xs">Excluded</span>
-                <div class="text-[10px] text-gray-600 mt-0.5">Updates disabled</div>`;
-            actionHtml = `<span class="text-gray-700 text-xs">—</span>`;
-        } else if (c.behind && c.rebuild_required) {
-            rowBg = 'bg-dark-700/40';
-            localStr = (c.local_sha || '').slice(0, 7);
-            remoteStr = (c.remote_sha || '').slice(0, 7);
-            statusHtml = `<span class="text-amber-400 font-semibold text-xs">Rebuild required</span>
-                <div class="text-[10px] text-gray-600 mt-0.5">${(c.blockers || []).length} unmounted file(s) changed</div>`;
-            actionHtml = `<button disabled title="Requires host-side rebuild"
-                class="bg-dark-700 text-gray-500 px-3 py-1 rounded-lg text-xs cursor-not-allowed">Blocked</button>`;
-        } else if (c.behind) {
-            rowBg = 'bg-dark-700/40';
-            localStr = (c.local_sha || '').slice(0, 7);
-            remoteStr = (c.remote_sha || '').slice(0, 7);
-            statusHtml = `<span class="text-amber-400 font-semibold text-xs">Update available</span>
-                <div class="text-[10px] text-gray-600 mt-0.5">${esc(c.repo)} · ${esc(c.branch)}</div>`;
-            actionHtml = `<button onclick="updaterUpdateCore(this)"
-                class="bg-accent/20 hover:bg-accent/30 text-accent px-3 py-1 rounded-lg text-xs transition">Update</button>`;
-        } else {
-            rowBg = 'bg-dark-800/30';
-            localStr = (c.local_sha || '').slice(0, 7);
-            remoteStr = (c.remote_sha || '').slice(0, 7);
-            statusHtml = `<span class="text-green-400 font-semibold text-xs">Up to date</span>`;
-            actionHtml = `<span class="text-gray-600 text-xs">—</span>`;
-        }
-
-        const exclCheckbox = c.tracking
-            ? `<label class="inline-flex items-center justify-center cursor-pointer" title="Exclude slopsmith core from update checks">
-                <input type="checkbox" data-plugin-id="${CORE_KEY}" onchange="updaterToggleExclude(this)"
-                    ${c.excluded ? 'checked' : ''}
-                    class="accent-amber-500 w-3.5 h-3.5 rounded">
-            </label>`
-            : '<span class="text-gray-700 text-xs">—</span>';
-
-        card.innerHTML = `
-            <div class="grid grid-cols-[1fr_auto_auto_auto_auto_auto] gap-x-4 text-xs text-gray-500 font-semibold uppercase tracking-wider px-3 py-2 border-b border-gray-800">
-                <span>Slopsmith Core</span>
-                <span class="w-24 text-center hidden sm:block">Local</span>
-                <span class="w-24 text-center hidden sm:block">Remote</span>
-                <span class="w-28 text-center">Status</span>
-                <span class="w-20 text-center" title="Exclude from automatic updates">Exclude</span>
-                <span class="w-40 text-center">Action</span>
-            </div>
-            <div class="grid grid-cols-[1fr_auto_auto_auto_auto_auto] gap-x-4 items-center px-3 py-2.5 rounded-lg ${rowBg} transition">
-                <div class="min-w-0">
-                    <a href="${esc(c.url)}" target="_blank" rel="noopener"
-                        class="text-sm text-white hover:text-accent hover:underline truncate inline-flex items-center gap-1"
-                        title="${esc(c.repo)} · open on GitHub">Slopsmith
-                        <svg class="w-3 h-3 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
-                    </a>
-                    <div class="text-xs text-gray-500 truncate">${esc(c.repo)} · ${esc(c.branch || 'main')}</div>
-                </div>
-                <span class="w-24 text-center text-xs text-gray-400 font-mono hidden sm:block">${esc(localStr)}</span>
-                <span class="w-24 text-center text-xs text-gray-400 font-mono hidden sm:block">${esc(remoteStr)}</span>
-                <span class="w-28 text-center">${statusHtml}</span>
-                <span class="w-20 text-center">${exclCheckbox}</span>
-                <span class="w-40 text-center">${actionHtml}</span>
-            </div>`;
-
-        if (c.rebuild_required && !c.excluded) {
-            rebuildBanner.classList.remove('hidden');
-            if (c.rebuild_command) rebuildCmdEl.textContent = c.rebuild_command;
-            rebuildFilesEl.innerHTML = (c.blockers || [])
-                .map(b => `<li>${esc(b.status || '?')}  ${esc(b.filename)}</li>`)
-                .join('');
-        } else {
-            rebuildBanner.classList.add('hidden');
-        }
-    }
-
-    window.updaterCopyRebuildCmd = async function () {
-        const btn = document.getElementById('updater-rebuild-copy-btn');
-        const cmd = document.getElementById('updater-rebuild-cmd').textContent;
-        try {
-            await navigator.clipboard.writeText(cmd);
-            btn.textContent = 'Copied';
-            setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
-        } catch (e) {
-            btn.textContent = 'Copy failed';
-        }
-    };
-
-    window.updaterInitCore = async function (btn) {
-        btn.disabled = true;
-        const orig = btn.textContent;
-        btn.textContent = 'Initializing...';
-        try {
-            const resp = await fetch(API + '/core/init', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({}),
-            });
-            const data = await resp.json();
-            if (data.ok) {
-                await updaterReloadCore();
-            } else {
-                btn.disabled = false;
-                btn.textContent = 'Failed';
-                btn.title = data.error || '';
-            }
-        } catch (e) {
-            btn.disabled = false;
-            btn.textContent = orig;
-            btn.title = e.message;
-        }
-    };
-
-    window.updaterUpdateCore = async function (btn) {
-        return updaterDoCoreUpdate(btn);
-    };
-
-    async function updaterDoCoreUpdate(btn) {
-        btn.disabled = true;
-        const orig = btn.textContent;
-        btn.textContent = 'Updating...';
-        try {
-            const resp = await fetch(API + '/core/update', { method: 'POST' });
-            const data = await resp.json();
-            if (data.ok) {
-                btn.outerHTML = '<span class="text-green-400 text-xs font-semibold">Updated</span>';
-                localStorage.setItem(RESTART_KEY, '1');
-                document.getElementById('updater-restart-banner').classList.remove('hidden');
-                await updaterReloadCore();
-                return true;
-            }
-            if (data.error === 'rebuild_required') {
-                btn.disabled = false;
-                btn.textContent = 'Blocked';
-                btn.className = 'bg-amber-900/30 text-amber-400 px-3 py-1 rounded-lg text-xs';
-                btn.title = data.message || 'Rebuild required';
-                await updaterReloadCore();
-                return false;
-            }
-            btn.disabled = false;
-            btn.textContent = 'Failed';
-            btn.title = data.error || 'Unknown error';
-            btn.className = 'bg-red-900/30 text-red-400 px-3 py-1 rounded-lg text-xs';
-            return false;
-        } catch (e) {
-            btn.disabled = false;
-            btn.textContent = orig;
-            btn.title = e.message;
-            return false;
-        }
-    }
-
-    async function updaterReloadCore() {
-        try {
-            const r = await fetch(API + '/core');
-            coreStatus = await r.json();
-            updaterRenderCore();
-            // Core state feeds the status counter (coreBehind) and
-            // Update-all visibility (coreUpdatable). Refresh after a
-            // core init / update so the header doesn't lag the card.
-            updaterRefreshStatusUI();
-        } catch (e) { /* ignore */ }
-    }
 
     function updaterRenderUpdates() {
         const c = document.getElementById('updater-table');
@@ -751,10 +540,7 @@
             const data = await resp.json();
             if (data.ok) {
                 excluded = new Set(data.excluded || []);
-                if (id === CORE_KEY) {
-                    if (coreStatus) coreStatus.excluded = shouldExclude;
-                    updaterRenderCore();
-                } else if (shouldExclude) {
+                if (shouldExclude) {
                     delete updates[id];
                     delete updateErrors[id];
                 }
@@ -892,13 +678,6 @@
         const allBtn = document.getElementById('updater-update-all-btn');
         allBtn.disabled = true;
         allBtn.textContent = 'Updating all...';
-
-        // Core first — if it's behind, applicable, and not blocked.
-        if (coreStatus && coreStatus.behind && !coreStatus.excluded && !coreStatus.rebuild_required) {
-            const coreCard = document.getElementById('updater-core-card');
-            const coreBtn = coreCard ? coreCard.querySelector('button[onclick^="updaterUpdateCore"]') : null;
-            if (coreBtn) await updaterDoCoreUpdate(coreBtn);
-        }
 
         for (const id of Object.keys(updates)) {
             if (excluded.has(id)) continue;
