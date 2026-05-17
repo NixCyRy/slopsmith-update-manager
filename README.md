@@ -19,9 +19,17 @@ A plugin for [Slopsmith](https://github.com/byrongamatos/slopsmith) that install
 
 ## What's New
 
+### v1.8.2
+- **Detect external restarts** — the per-row "Updated · restart to apply" UI now clears itself when the server has been restarted outside the in-app "Restart now" flow (e.g. `docker compose restart`, host-side process kill). New `GET /api/plugins/update_manager/start_time` endpoint exposes the process start time; the frontend records it in `localStorage["update_manager:knownStartTime"]` and clears pending state + the restart banner when it sees the value change.
+
+### v1.8.1
+- **Fix stuck "Update available" after `git pull`** — `_resolve_source` now picks the freshest of the marker (`installed_at`, falling back to the marker file's own mtime if missing/malformed) and the git ref's mtime — where "git ref" means whichever file the SHA was actually read from: `.git/refs/heads/<branch>` for loose refs, `.git/packed-refs` for packed-ref repos, or `.git/HEAD` for detached-HEAD checkouts. Cloned plugins whose marker is older than the current ref no longer appear behind forever; UI-zip-updated cloned plugins still surface the marker since it gets a newer `installed_at` than the preserved `.git/`. Bonus: per-row "Updated · restart to apply" status appears on plugins immediately after clicking Update, replacing the stale "Update available" until the user restarts.
+
+### v1.8.0
+- **Per-plugin Check button** — each plugin row now has a "Check" button next to its primary action. Re-checks just that plugin against GitHub, useful when the bulk cold pass has burnt through GitHub's anonymous rate-limit window and left some rows in "Check failed". Backed by a new `GET /check/{plugin_id}` endpoint that reuses the same conditional-fetch / version-first short-circuit as the bulk pass.
+
 ### v1.6.0
-- **Desktop compatibility** — works with [slopsmith-desktop](https://github.com/byrongamatos/slopsmith-desktop): Docker-specific UI (the `docker compose restart` snippet) is hidden inside the desktop app, restart delegates to `slopsmithDesktop.plugins.restart()`, and staged self-updates are flushed before the desktop-managed restart
-- **Removed: Slopsmith core tracking** — the in-app core update feature has been removed; updates to slopsmith itself are applied by rebuilding the container in the usual way
+- **Desktop compatibility** — works with [slopsmith-desktop](https://github.com/byrongamatos/slopsmith-desktop): Docker-specific UI (the `docker compose restart` snippet) is hidden inside the desktop app, and staged self-updates are flushed before the desktop-managed restart via `slopsmithDesktop.plugins.restart()`
 
 ### v1.5.0
 - **Self-update** — the Update Manager can now update itself. Clicking Update stages the new version to disk, then a banner prompts you to restart to apply it.
@@ -62,6 +70,8 @@ All endpoints are namespaced under `/api/plugins/update_manager/`:
 | GET    | `/config`                   | Returns `{is_desktop}` — detected via `SLOPSMITH_DESKTOP` env var |
 | GET    | `/registry`                 | Parses slopsmith's README and returns the plugin list |
 | GET    | `/updates`                  | Compares installed plugins against GitHub    |
+| GET    | `/check/{plugin_id}`        | Re-checks one plugin. Success: `{plugin_id, update, error, source, excluded, bundled}`. Validation failure (invalid id / not installed): `{error}` only (no `plugin_id`) |
+| GET    | `/start_time`               | Returns `{started_at}` (server process start time, seconds since epoch). Used by the UI to detect external restarts. |
 | POST   | `/install`                  | Body `{url, dirname}` — installs from a GitHub repo |
 | POST   | `/update/{plugin_id}`       | Re-downloads latest source and swaps; for `update_manager` itself, stages files and returns `{pending_restart: true}` |
 | POST   | `/uninstall/{plugin_id}`    | Removes the plugin directory                 |

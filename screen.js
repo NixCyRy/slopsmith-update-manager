@@ -1,7 +1,10 @@
 /* Update Manager - install + update plugins and slopsmith core over GitHub */
 (function () {
     const RESTART_KEY = 'update_manager:restartPending';
+    const PENDING_IDS_KEY = 'update_manager:pendingRestartIds';
+    const START_TIME_KEY = 'update_manager:knownStartTime';
     const API = '/api/plugins/update_manager';
+    const CORE_KEY = '__core__';
 
     let plugins = [];        // /api/plugins result (installed list)
     let updates = {};        // API + '/updates' -> { [id]: {local, remote, branch, source, repo} }
@@ -10,8 +13,116 @@
     let excluded = new Set(); // plugin ids the user has opted out of updates for
     let bundledIds = new Set(); // plugin ids that ship with slopsmith core (issue #1)
     let registry = [];       // API + '/registry' -> entries
+    let coreStatus = null;   // API + '/core'
     let currentTab = 'updates';
     let isDesktop = !!window.slopsmithDesktop?.isDesktop;
+    let _inflightChecks = new Set(); // plugin ids with an in-flight per-row recheck
+    // Plugin ids whose update was applied but still need a server
+    // restart to take effect. Persists across page reloads via
+    // PENDING_IDS_KEY so the row keeps the "Updated · restart to
+    // apply" status until the user actually restarts.
+    let _pendingRestart = new Set(loadPendingRestart());
+
+    function loadPendingRestart() {
+        try {
+            const raw = localStorage.getItem(PENDING_IDS_KEY);
+            if (!raw) return [];
+            const arr = JSON.parse(raw);
+            return Array.isArray(arr) ? arr.filter(x => typeof x === 'string') : [];
+        } catch (e) { return []; }
+    }
+    function savePendingRestart() {
+        try {
+            localStorage.setItem(PENDING_IDS_KEY, JSON.stringify([..._pendingRestart]));
+        } catch (e) { /* ignore */ }
+    }
+    function markPendingRestart(id) {
+        _pendingRestart.add(id);
+        savePendingRestart();
+    }
+    function clearPendingRestart() {
+        _pendingRestart.clear();
+        try { localStorage.removeItem(PENDING_IDS_KEY); } catch (e) { /* ignore */ }
+    }
+
+    // Detect external server restarts (docker compose restart, host
+    // kill, …) so the per-row "Updated · restart to apply" UI doesn't
+    // stick across them. Compares the backend's process start_time
+    // against the value last written to localStorage. On change with
+    // pending entries: those updates are now live, clear pending.
+    //
+    // In-flight calls dedupe via _syncInFlight: updaterOnShow awaits
+    // it before showing the banner, then immediately calls
+    // updaterCheck which would otherwise refetch /start_time. Each
+    // resolved promise is single-use so subsequent unrelated calls
+    // (post-update, banner-dismiss…) still hit the network freshly.
+    let _syncInFlight = null;
+    function syncProcessStartTime() {
+        if (_syncInFlight) return _syncInFlight;
+        _syncInFlight = (async () => {
+            try {
+                return await _doSyncProcessStartTime();
+            } finally {
+                _syncInFlight = null;
+            }
+        })();
+        return _syncInFlight;
+    }
+    async function _doSyncProcessStartTime() {
+        let started_at;
+        try {
+            const r = await fetch(API + '/start_time', { cache: 'no-store' });
+            const j = await r.json();
+            started_at = (j && typeof j.started_at === 'number') ? j.started_at : null;
+        } catch (e) { started_at = null; }
+        if (started_at === null) return;
+        let prev = null;
+        try {
+            const raw = localStorage.getItem(START_TIME_KEY);
+            prev = raw ? Number(raw) : null;
+            if (!Number.isFinite(prev)) prev = null;
+        } catch (e) { prev = null; }
+        if (prev !== null && prev !== started_at) {
+            // Clear any restart-pending state held over from before
+            // the restart. _pendingRestart covers per-plugin updates;
+            // RESTART_KEY also gets set by core-update flows that
+            // never touch _pendingRestart, so check both.
+            let restartFlag = null;
+            try { restartFlag = localStorage.getItem(RESTART_KEY); } catch (e) { /* ignore */ }
+            if (_pendingRestart.size > 0 || restartFlag === '1') {
+                clearPendingRestart();
+                try { localStorage.removeItem(RESTART_KEY); } catch (e) { /* ignore */ }
+                const banner = document.getElementById('updater-restart-banner');
+                if (banner) banner.classList.add('hidden');
+            }
+        }
+        try { localStorage.setItem(START_TIME_KEY, String(started_at)); } catch (e) { /* ignore */ }
+    }
+
+    // Refresh the "N updates available" status text and Update-all
+    // button visibility from current state. Called after any flow that
+    // mutates `updates` / `excluded` / `coreStatus`. Centralised so the
+    // counter rules don't drift between bulk check, exclusion toggle,
+    // and per-row recheck.
+    function updaterRefreshStatusUI() {
+        // Pending-restart ids are functionally up-to-date locally —
+        // their new code is staged on disk; only the running process
+        // is stale. Don't count them in the header, don't show
+        // Update-all for them, don't let updaterUpdateAll re-pick
+        // them on the next pass.
+        const pluginCount = Object.keys(updates).filter(id => !_pendingRestart.has(id)).length;
+        const coreBehind = !!(coreStatus && coreStatus.behind && !coreStatus.excluded);
+        const total = pluginCount + (coreBehind ? 1 : 0);
+        const statusEl = document.getElementById('updater-status');
+        if (statusEl) {
+            statusEl.textContent = total === 0
+                ? 'Everything up to date.'
+                : total + ' update' + (total > 1 ? 's' : '') + ' available';
+        }
+        const coreUpdatable = coreBehind && !coreStatus.rebuild_required;
+        const allBtn = document.getElementById('updater-update-all-btn');
+        if (allBtn) allBtn.classList.toggle('hidden', pluginCount === 0 && !coreUpdatable);
+    }
 
     // ── Screen show hook ───────────────────────────────────────────────
     const _origShowScreen = window.showScreen;
@@ -26,7 +137,13 @@
             const cfg = await r.json();
             isDesktop = cfg.is_desktop ?? isDesktop;
         } catch (e) { /* fall back to window.slopsmithDesktop */ }
-        if (localStorage.getItem(RESTART_KEY) === '1') {
+        // Resolve external-restart drift before deciding whether to
+        // surface the banner. Avoids flashing "restart pending" on a
+        // server that's already running new code.
+        await syncProcessStartTime();
+        let restartFlag = null;
+        try { restartFlag = localStorage.getItem(RESTART_KEY); } catch (e) { /* storage blocked */ }
+        if (restartFlag === '1') {
             document.getElementById('updater-restart-banner').classList.remove('hidden');
         }
         if (isDesktop) {
@@ -72,9 +189,15 @@
         status.textContent = '';
         table.innerHTML = '';
         try {
-            const [pRes, uRes] = await Promise.all([
+            // Run start-time sync in parallel with the three data
+            // fetches. Awaited before the pending-id strip below
+            // so the freshly-fetched `updates` is filtered against
+            // the post-clear pending set.
+            const syncP = syncProcessStartTime();
+            const [pRes, uRes, cRes] = await Promise.all([
                 fetch('/api/plugins'),
                 fetch(API + '/updates'),
+                fetch(API + '/core'),
             ]);
             plugins = await pRes.json();
             const uData = await uRes.json();
@@ -83,15 +206,23 @@
             sources = uData.sources || {};
             excluded = new Set(uData.excluded || []);
             bundledIds = new Set(uData.bundled || []);
+            coreStatus = await cRes.json();
+            await syncP;
+            // Strip pending-restart ids from `updates` so the backend
+            // can't re-introduce them between Update click and
+            // restart. The marker write at update time may not yet
+            // reflect on the GitHub-cached side, and we don't want
+            // to revert the row's pending-restart UI just because
+            // the bulk recheck still sees mismatched shas.
+            for (const id of _pendingRestart) {
+                delete updates[id];
+                delete updateErrors[id];
+            }
+            updaterRenderCore();
             updaterRenderUpdates();
             document.getElementById('updater-last-checked').textContent =
                 'Last checked: ' + new Date().toLocaleTimeString();
-            const pluginCount = Object.keys(updates).length;
-            status.textContent = pluginCount === 0
-                ? 'Everything up to date.'
-                : pluginCount + ' update' + (pluginCount > 1 ? 's' : '') + ' available';
-            document.getElementById('updater-update-all-btn')
-                .classList.toggle('hidden', pluginCount === 0);
+            updaterRefreshStatusUI();
         } catch (e) {
             status.textContent = 'Check failed: ' + e.message;
         } finally {
@@ -100,6 +231,198 @@
             loading.classList.add('hidden');
         }
     };
+
+    // ── Core card ──────────────────────────────────────────────────────
+    function updaterRenderCore() {
+        const card = document.getElementById('updater-core-card');
+        const rebuildBanner = document.getElementById('updater-rebuild-banner');
+        const rebuildCmdEl = document.getElementById('updater-rebuild-cmd');
+        const rebuildFilesEl = document.getElementById('updater-rebuild-files');
+        if (!card) return;
+        if (!coreStatus || coreStatus.hidden) {
+            card.classList.add('hidden');
+            if (rebuildBanner) rebuildBanner.classList.add('hidden');
+            return;
+        }
+
+        const c = coreStatus;
+        card.classList.remove('hidden');
+
+        let statusHtml, actionHtml, localStr = '', remoteStr = '', rowBg;
+
+        if (c.error) {
+            rowBg = 'bg-dark-800/30';
+            statusHtml = `<span class="text-red-400 text-xs" title="${esc(c.error)}">Check failed</span>`;
+            actionHtml = `<button onclick="updaterCheck()" class="text-gray-400 hover:text-white text-xs transition">Retry</button>`;
+        } else if (!c.tracking) {
+            rowBg = 'bg-dark-800/30';
+            statusHtml = `<span class="text-gray-400 font-semibold text-xs">Tracking not initialized</span>
+                <div class="text-[10px] text-gray-600 mt-0.5">Stamp the current commit to enable update checks</div>`;
+            actionHtml = `<button onclick="updaterInitCore(this)"
+                class="bg-accent/20 hover:bg-accent/30 text-accent px-3 py-1 rounded-lg text-xs transition">Initialize tracking</button>`;
+            remoteStr = (c.remote_sha || '').slice(0, 7);
+        } else if (c.excluded) {
+            rowBg = 'bg-dark-900/40 opacity-60';
+            localStr = (c.local_sha || '').slice(0, 7);
+            remoteStr = (c.remote_sha || '').slice(0, 7);
+            statusHtml = `<span class="text-gray-500 font-semibold text-xs">Excluded</span>
+                <div class="text-[10px] text-gray-600 mt-0.5">Updates disabled</div>`;
+            actionHtml = `<span class="text-gray-700 text-xs">—</span>`;
+        } else if (c.behind && c.rebuild_required) {
+            rowBg = 'bg-dark-700/40';
+            localStr = (c.local_sha || '').slice(0, 7);
+            remoteStr = (c.remote_sha || '').slice(0, 7);
+            statusHtml = `<span class="text-amber-400 font-semibold text-xs">Rebuild required</span>
+                <div class="text-[10px] text-gray-600 mt-0.5">${(c.blockers || []).length} unmounted file(s) changed</div>`;
+            actionHtml = `<button disabled title="Requires host-side rebuild"
+                class="bg-dark-700 text-gray-500 px-3 py-1 rounded-lg text-xs cursor-not-allowed">Blocked</button>`;
+        } else if (c.behind) {
+            rowBg = 'bg-dark-700/40';
+            localStr = (c.local_sha || '').slice(0, 7);
+            remoteStr = (c.remote_sha || '').slice(0, 7);
+            statusHtml = `<span class="text-amber-400 font-semibold text-xs">Update available</span>
+                <div class="text-[10px] text-gray-600 mt-0.5">${esc(c.repo)} · ${esc(c.branch)}</div>`;
+            actionHtml = `<button onclick="updaterUpdateCore(this)"
+                class="bg-accent/20 hover:bg-accent/30 text-accent px-3 py-1 rounded-lg text-xs transition">Update</button>`;
+        } else {
+            rowBg = 'bg-dark-800/30';
+            localStr = (c.local_sha || '').slice(0, 7);
+            remoteStr = (c.remote_sha || '').slice(0, 7);
+            statusHtml = `<span class="text-green-400 font-semibold text-xs">Up to date</span>`;
+            actionHtml = `<span class="text-gray-600 text-xs">—</span>`;
+        }
+
+        const exclCheckbox = c.tracking
+            ? `<label class="inline-flex items-center justify-center cursor-pointer" title="Exclude slopsmith core from update checks">
+                <input type="checkbox" data-plugin-id="${CORE_KEY}" onchange="updaterToggleExclude(this)"
+                    ${c.excluded ? 'checked' : ''}
+                    class="accent-amber-500 w-3.5 h-3.5 rounded">
+            </label>`
+            : '<span class="text-gray-700 text-xs">—</span>';
+
+        card.innerHTML = `
+            <div class="grid grid-cols-[1fr_auto_auto_auto_auto_auto] gap-x-4 text-xs text-gray-500 font-semibold uppercase tracking-wider px-3 py-2 border-b border-gray-800">
+                <span>Slopsmith Core</span>
+                <span class="w-24 text-center hidden sm:block">Local</span>
+                <span class="w-24 text-center hidden sm:block">Remote</span>
+                <span class="w-28 text-center">Status</span>
+                <span class="w-20 text-center" title="Exclude from automatic updates">Exclude</span>
+                <span class="w-40 text-center">Action</span>
+            </div>
+            <div class="grid grid-cols-[1fr_auto_auto_auto_auto_auto] gap-x-4 items-center px-3 py-2.5 rounded-lg ${rowBg} transition">
+                <div class="min-w-0">
+                    <a href="${esc(c.url)}" target="_blank" rel="noopener"
+                        class="text-sm text-white hover:text-accent hover:underline truncate inline-flex items-center gap-1"
+                        title="${esc(c.repo)} · open on GitHub">Slopsmith
+                        <svg class="w-3 h-3 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+                    </a>
+                    <div class="text-xs text-gray-500 truncate">${esc(c.repo)} · ${esc(c.branch || 'main')}</div>
+                </div>
+                <span class="w-24 text-center text-xs text-gray-400 font-mono hidden sm:block">${esc(localStr)}</span>
+                <span class="w-24 text-center text-xs text-gray-400 font-mono hidden sm:block">${esc(remoteStr)}</span>
+                <span class="w-28 text-center">${statusHtml}</span>
+                <span class="w-20 text-center">${exclCheckbox}</span>
+                <span class="w-40 text-center">${actionHtml}</span>
+            </div>`;
+
+        if (c.rebuild_required && !c.excluded) {
+            rebuildBanner.classList.remove('hidden');
+            if (c.rebuild_command) rebuildCmdEl.textContent = c.rebuild_command;
+            rebuildFilesEl.innerHTML = (c.blockers || [])
+                .map(b => `<li>${esc(b.status || '?')}  ${esc(b.filename)}</li>`)
+                .join('');
+        } else {
+            rebuildBanner.classList.add('hidden');
+        }
+    }
+
+    window.updaterCopyRebuildCmd = async function () {
+        const btn = document.getElementById('updater-rebuild-copy-btn');
+        const cmd = document.getElementById('updater-rebuild-cmd').textContent;
+        try {
+            await navigator.clipboard.writeText(cmd);
+            btn.textContent = 'Copied';
+            setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+        } catch (e) {
+            btn.textContent = 'Copy failed';
+        }
+    };
+
+    window.updaterInitCore = async function (btn) {
+        btn.disabled = true;
+        const orig = btn.textContent;
+        btn.textContent = 'Initializing...';
+        try {
+            const resp = await fetch(API + '/core/init', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+            });
+            const data = await resp.json();
+            if (data.ok) {
+                await updaterReloadCore();
+            } else {
+                btn.disabled = false;
+                btn.textContent = 'Failed';
+                btn.title = data.error || '';
+            }
+        } catch (e) {
+            btn.disabled = false;
+            btn.textContent = orig;
+            btn.title = e.message;
+        }
+    };
+
+    window.updaterUpdateCore = async function (btn) {
+        return updaterDoCoreUpdate(btn);
+    };
+
+    async function updaterDoCoreUpdate(btn) {
+        btn.disabled = true;
+        const orig = btn.textContent;
+        btn.textContent = 'Updating...';
+        try {
+            const resp = await fetch(API + '/core/update', { method: 'POST' });
+            const data = await resp.json();
+            if (data.ok) {
+                btn.outerHTML = '<span class="text-green-400 text-xs font-semibold">Updated</span>';
+                localStorage.setItem(RESTART_KEY, '1');
+                document.getElementById('updater-restart-banner').classList.remove('hidden');
+                await updaterReloadCore();
+                return true;
+            }
+            if (data.error === 'rebuild_required') {
+                btn.disabled = false;
+                btn.textContent = 'Blocked';
+                btn.className = 'bg-amber-900/30 text-amber-400 px-3 py-1 rounded-lg text-xs';
+                btn.title = data.message || 'Rebuild required';
+                await updaterReloadCore();
+                return false;
+            }
+            btn.disabled = false;
+            btn.textContent = 'Failed';
+            btn.title = data.error || 'Unknown error';
+            btn.className = 'bg-red-900/30 text-red-400 px-3 py-1 rounded-lg text-xs';
+            return false;
+        } catch (e) {
+            btn.disabled = false;
+            btn.textContent = orig;
+            btn.title = e.message;
+            return false;
+        }
+    }
+
+    async function updaterReloadCore() {
+        try {
+            const r = await fetch(API + '/core');
+            coreStatus = await r.json();
+            updaterRenderCore();
+            // Core state feeds the status counter (coreBehind) and
+            // Update-all visibility (coreUpdatable). Refresh after a
+            // core init / update so the header doesn't lag the card.
+            updaterRefreshStatusUI();
+        } catch (e) { /* ignore */ }
+    }
 
     function updaterRenderUpdates() {
         const c = document.getElementById('updater-table');
@@ -110,11 +433,11 @@
 
         let html = `<div class="grid grid-cols-[1fr_auto_auto_auto_auto_auto] gap-x-4 text-xs text-gray-500 font-semibold uppercase tracking-wider px-3 py-2 border-b border-gray-800">
             <span>Plugin</span>
-            <span class="w-24 text-center hidden sm:block">Local</span>
-            <span class="w-24 text-center hidden sm:block">Remote</span>
+            <span class="w-28 text-center hidden sm:block" title="Installed version (and short commit sha)">Local</span>
+            <span class="w-28 text-center hidden sm:block" title="Latest version on the tracked branch">Remote</span>
             <span class="w-28 text-center">Status</span>
             <span class="w-20 text-center" title="Exclude from automatic updates">Exclude</span>
-            <span class="w-40 text-center">Action</span>
+            <span class="w-44 text-center">Action</span>
         </div>`;
 
         for (const p of plugins) {
@@ -123,9 +446,25 @@
             const isExcluded = excluded.has(p.id);
             const isSelf = p.id === 'update_manager';
             const isBundled = bundledIds.has(p.id) || p.bundled === true;
+            const src = sources[p.id] || {};
+            const localVersion = u && u.local_version || src.local_version || '';
+            const remoteVersion = u && u.remote_version || src.remote_version || '';
+            const localShaShort = u && u.local || '';
+            const remoteShaShort = u && u.remote || '';
 
             let statusHtml, actionHtml, rowBg, localStr = '', remoteStr = '';
-            if (isBundled) {
+            const isPendingRestart = _pendingRestart.has(p.id);
+            if (isPendingRestart && !isBundled) {
+                // Update was applied but the new code isn't loaded
+                // until the user restarts. Override "Update available"
+                // (which the bulk endpoint may still report until the
+                // marker hits the GitHub cache) so the row reflects
+                // local reality immediately after the click.
+                rowBg = 'bg-dark-700/40';
+                statusHtml = `<span class="text-amber-400 font-semibold text-xs">Updated · restart to apply</span>
+                    <div class="text-[10px] text-gray-600 mt-0.5">Click “Restart now” above</div>`;
+                actionHtml = `<span class="text-gray-600 text-xs">—</span>`;
+            } else if (isBundled) {
                 rowBg = 'bg-dark-800/30';
                 statusHtml = `<span class="text-sky-400 font-semibold text-xs inline-flex items-center gap-1">
                         <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
@@ -154,14 +493,37 @@
                     const br = errObj.branch || 'unknown';
                     statusHtml = `<span class="text-sky-400 font-semibold text-xs" title="Switch to the published branch (usually main), or push '${esc(br)}' to origin">Branch not published</span>
                         <div class="text-[10px] text-gray-600 mt-0.5">Local branch <code class="text-gray-400">${esc(br)}</code> not on remote</div>`;
+                } else if (errObj.code === 'source_unresolved') {
+                    statusHtml = `<span class="text-amber-400 text-xs" title="${esc(errObj.message || '')}">Source unknown</span>
+                        <div class="text-[10px] text-gray-600 mt-0.5">Re-install via Browse to record its repo</div>`;
+                } else if (errObj.code === 'manifest_not_found') {
+                    const br = errObj.branch ? esc(errObj.branch) : '';
+                    statusHtml = `<span class="text-amber-400 text-xs" title="${esc(errObj.message || '')}">Manifest not found</span>
+                        <div class="text-[10px] text-gray-600 mt-0.5">${br ? `Branch <code class="text-gray-400">${br}</code> / repo / plugin.json may be missing` : 'Branch, repo, or plugin.json may be missing'} — click Check for details</div>`;
+                } else if (errObj.code === 'manifest_no_version') {
+                    statusHtml = `<span class="text-amber-400 text-xs" title="${esc(errObj.message || '')}">Manifest has no version</span>
+                        <div class="text-[10px] text-gray-600 mt-0.5">Plugin author needs to add a version field</div>`;
+                } else if (errObj.code === 'version_unavailable') {
+                    statusHtml = `<span class="text-amber-400 text-xs" title="${esc(errObj.message || '')}">Couldn't reach repo</span>
+                        <div class="text-[10px] text-gray-600 mt-0.5">Click Check to retry</div>`;
                 } else {
-                    statusHtml = `<span class="text-red-400 text-xs" title="${esc(errObj.message || 'Check failed')}">Check failed</span>`;
+                    statusHtml = `<span class="text-red-400 text-xs" title="${esc(errObj.message || 'Check failed')}">Check failed</span>
+                        <div class="text-[10px] text-gray-600 mt-0.5">Click Check to retry</div>`;
                 }
                 actionHtml = `<span class="text-gray-600 text-xs">—</span>`;
             } else if (isSelf) {
                 rowBg = 'bg-dark-800/30';
-                statusHtml = `<span class="text-green-400 font-semibold text-xs">Up to date</span>`;
-                actionHtml = `<span class="text-gray-600 text-xs">—</span>`;
+                if (u) {
+                    localStr = u.local;
+                    remoteStr = u.remote;
+                    statusHtml = `<span class="text-amber-400 font-semibold text-xs">Update available</span>
+                        <div class="text-[10px] text-gray-600 mt-0.5">${esc(u.repo)} · ${esc(u.branch)}</div>`;
+                    actionHtml = `<button data-plugin-id="${esc(p.id)}" onclick="updaterUpdate(this)"
+                        class="bg-accent/20 hover:bg-accent/30 text-accent px-3 py-1 rounded-lg text-xs transition">Update</button>`;
+                } else {
+                    statusHtml = `<span class="text-gray-500 text-xs">Self</span>`;
+                    actionHtml = `<span class="text-gray-600 text-xs">—</span>`;
+                }
             } else {
                 rowBg = 'bg-dark-800/30';
                 statusHtml = `<span class="text-green-400 font-semibold text-xs">Up to date</span>`;
@@ -177,7 +539,6 @@
                         class="accent-amber-500 w-3.5 h-3.5 rounded">
                 </label>`;
 
-            const src = sources[p.id];
             const nameHtml = (src && src.url)
                 ? `<a href="${esc(src.url)}" target="_blank" rel="noopener"
                         class="text-sm text-white hover:text-accent hover:underline truncate inline-flex items-center gap-1"
@@ -186,20 +547,196 @@
                     </a>`
                 : `<div class="text-sm text-white truncate">${esc(p.name)}</div>`;
 
-            html += `<div class="grid grid-cols-[1fr_auto_auto_auto_auto_auto] gap-x-4 items-center px-3 py-2.5 rounded-lg ${rowBg} transition" data-row-id="${esc(p.id)}">
+            // Version pickers are useful for any plugin that the
+            // backend can resolve a remote source for — even up-to-date
+            // ones (downgrade flow). Hide for bundled plugins (managed
+            // by core) and for the update_manager itself if the user
+            // is mid-self-update flow (avoids surprise during pending
+            // restart). The button is plain text so it doesn't compete
+            // visually with the primary Update / Uninstall action.
+            const canPickVersion = !isBundled && !isExcluded && !!(src && src.url);
+            const versionsBtn = canPickVersion
+                ? `<button data-plugin-id="${esc(p.id)}" onclick="updaterShowVersions(this)"
+                        class="text-gray-500 hover:text-accent text-xs transition"
+                        title="Pin this plugin to a specific version (upgrade or downgrade)">Versions</button>`
+                : '';
+
+            // Per-row recheck. ALWAYS shown for non-bundled (external)
+            // plugins — the backend's /check/{id} endpoint does the full
+            // check, force-refreshes the registry if the source couldn't
+            // be resolved on the cold pass, and never depends on the
+            // bulk pass having succeeded. (The bulk /updates pass makes
+            // zero api.github.com calls, so the entire 60/hour budget is
+            // available for these on-demand single-plugin checks — an
+            // end user can always re-check and update any individual
+            // external plugin, even right after a cold first run.)
+            // Bundled plugins are managed by slopsmith core; no Check
+            // button for them.
+            const canRecheck = !isBundled;
+            const checking = _inflightChecks.has(p.id);
+            // Excluded rows skip the GitHub round-trip on the backend
+            // and only re-sync local state — phrase the tooltip
+            // accordingly so users aren't promised a network call that
+            // won't happen.
+            const checkTitle = isExcluded
+                ? 'Re-sync excluded state from server'
+                : 'Re-check this plugin against GitHub now';
+            const checkBtn = canRecheck
+                ? `<button data-plugin-id="${esc(p.id)}" onclick="updaterCheckOne(this)"
+                        ${checking ? 'disabled' : ''}
+                        class="text-gray-500 hover:text-white text-xs transition ${checking ? 'opacity-60 cursor-wait' : ''}"
+                        title="${esc(checkTitle)}">${checking ? '…' : 'Check'}</button>`
+                : '';
+
+            const localCell = (localVersion || localShaShort)
+                ? `<div class="leading-tight">
+                        ${localVersion ? `<div class="text-gray-200 text-xs">${esc(localVersion)}</div>` : ''}
+                        ${localShaShort ? `<div class="text-gray-500 text-[10px] font-mono">${esc(localShaShort)}</div>` : ''}
+                    </div>`
+                : '<span class="text-gray-700 text-xs">—</span>';
+            const remoteCell = (remoteVersion || remoteShaShort)
+                ? `<div class="leading-tight">
+                        ${remoteVersion ? `<div class="text-gray-200 text-xs">${esc(remoteVersion)}</div>` : ''}
+                        ${remoteShaShort ? `<div class="text-gray-500 text-[10px] font-mono">${esc(remoteShaShort)}</div>` : ''}
+                    </div>`
+                : '<span class="text-gray-700 text-xs">—</span>';
+
+            html += `<div class="grid grid-cols-[1fr_auto_auto_auto_auto_auto] gap-x-4 items-center px-3 py-2.5 rounded-lg ${rowBg} transition relative" data-row-id="${esc(p.id)}">
                 <div class="min-w-0">
                     ${nameHtml}
                     <div class="text-xs text-gray-500 truncate">${esc(p.id)}</div>
                 </div>
-                <span class="w-24 text-center text-xs text-gray-400 font-mono hidden sm:block">${esc(localStr)}</span>
-                <span class="w-24 text-center text-xs text-gray-400 font-mono hidden sm:block">${esc(remoteStr)}</span>
+                <span class="w-28 text-center hidden sm:block">${localCell}</span>
+                <span class="w-28 text-center hidden sm:block">${remoteCell}</span>
                 <span class="w-28 text-center">${statusHtml}</span>
                 <span class="w-20 text-center">${exclCheckbox}</span>
-                <span class="w-40 text-center">${actionHtml}</span>
+                <span class="w-44 text-center">
+                    <div class="flex items-center justify-center gap-2">
+                        ${checkBtn}
+                        ${actionHtml}
+                        ${versionsBtn}
+                    </div>
+                </span>
             </div>`;
         }
         c.innerHTML = html;
     }
+
+    // ── Version picker (issue #5: pin to specific version) ─────────────
+    //
+    // A small popover anchored to the row's "Versions" button. Lazy-
+    // fetches /versions/{id} only when the user opens the picker, so
+    // the per-page Check-for-updates pass doesn't pay the rate-limit
+    // cost (one tags listing + N plugin.json fetches) for plugins the
+    // user never opens.
+    let _activeVersionPopover = null;
+    window.updaterShowVersions = async function (btn) {
+        // Toggle: clicking the same button again closes the popover.
+        if (_activeVersionPopover && _activeVersionPopover.dataset.pluginId === btn.dataset.pluginId) {
+            _activeVersionPopover.remove();
+            _activeVersionPopover = null;
+            return;
+        }
+        if (_activeVersionPopover) {
+            _activeVersionPopover.remove();
+            _activeVersionPopover = null;
+        }
+        const id = btn.dataset.pluginId;
+        const row = btn.closest('[data-row-id]');
+        if (!row) return;
+        const pop = document.createElement('div');
+        pop.dataset.pluginId = id;
+        pop.className = 'absolute right-3 top-full mt-1 z-50 bg-dark-800 border border-gray-700 rounded-lg shadow-xl text-xs w-72 max-h-72 overflow-y-auto';
+        pop.innerHTML = '<div class="px-3 py-2 text-gray-500">Loading versions…</div>';
+        row.appendChild(pop);
+        _activeVersionPopover = pop;
+        // Outside-click dismiss. Set up after a tick so the click that
+        // opened the popover doesn't immediately close it.
+        setTimeout(() => {
+            const off = (ev) => {
+                if (!pop.contains(ev.target) && ev.target !== btn) {
+                    pop.remove();
+                    if (_activeVersionPopover === pop) _activeVersionPopover = null;
+                    document.removeEventListener('click', off, true);
+                }
+            };
+            document.addEventListener('click', off, true);
+        }, 0);
+        try {
+            const r = await fetch(API + '/versions/' + encodeURIComponent(id));
+            const data = await r.json();
+            if (data.error) {
+                pop.innerHTML = `<div class="px-3 py-2 text-red-400">${esc(data.error)}</div>`;
+                return;
+            }
+            const versions = data.versions || [];
+            if (!versions.length) {
+                pop.innerHTML = `
+                    <div class="px-3 py-2 text-gray-400">
+                        No versioned releases found.
+                        <div class="text-[10px] text-gray-600 mt-1">
+                            This repo has no git tags and no plugin.json version-bump commits we can pin to.
+                            Use the regular <em>Update</em> button to track the latest commit on the branch.
+                        </div>
+                    </div>`;
+                return;
+            }
+            const currentSha = data.current_sha || '';
+            const currentVer = data.current_version || '';
+            const items = versions.map(v => {
+                const isCurrent = (v.sha && v.sha === currentSha) || (v.version && v.version === currentVer);
+                const verLabel = v.version || v.label || '(unknown)';
+                const tagBadge = v.source === 'tag'
+                    ? `<span class="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-sky-900/40 text-sky-300">tag ${esc(v.label)}</span>`
+                    : '';
+                const shaBadge = v.sha
+                    ? `<span class="ml-2 text-[10px] text-gray-500 font-mono">${esc(v.sha.slice(0, 7))}</span>`
+                    : '';
+                const currentBadge = isCurrent
+                    ? '<span class="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-green-900/40 text-green-300">current</span>'
+                    : '';
+                const click = isCurrent
+                    ? ''
+                    : `onclick="updaterUpdateAtRef('${esc(id)}', '${esc(v.ref)}', '${esc(verLabel)}')"`;
+                const interactive = isCurrent ? 'cursor-default text-gray-500' : 'cursor-pointer hover:bg-dark-700 text-gray-200';
+                return `<div ${click} class="px-3 py-2 ${interactive} border-b border-gray-800 last:border-b-0 flex items-center justify-between">
+                    <span class="truncate">${esc(verLabel)}${tagBadge}${currentBadge}</span>
+                    <span>${shaBadge}</span>
+                </div>`;
+            }).join('');
+            pop.innerHTML = `<div class="px-3 py-2 text-[10px] text-gray-500 border-b border-gray-800 sticky top-0 bg-dark-800">
+                    Pick a version (downgrade or upgrade)
+                </div>${items}`;
+        } catch (e) {
+            pop.innerHTML = `<div class="px-3 py-2 text-red-400">Failed: ${esc(e.message)}</div>`;
+        }
+    };
+
+    window.updaterUpdateAtRef = async function (id, ref, label) {
+        if (!confirm(`Switch ${id} to ${label}?\n\nThis replaces the plugin's files with the version at ref:\n  ${ref}\n\nA restart is required to pick up the change.`)) return;
+        if (_activeVersionPopover) {
+            _activeVersionPopover.remove();
+            _activeVersionPopover = null;
+        }
+        try {
+            const resp = await fetch(API + '/update/' + encodeURIComponent(id), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ref }),
+            });
+            const data = await resp.json();
+            if (data.ok) {
+                localStorage.setItem(RESTART_KEY, '1');
+                document.getElementById('updater-restart-banner').classList.remove('hidden');
+                // Re-check so the row reflects the new local sha/version.
+                if (typeof updaterCheck === 'function') updaterCheck();
+            } else {
+                alert('Failed to switch version: ' + (data.error || 'unknown error'));
+            }
+        } catch (e) {
+            alert('Failed to switch version: ' + e.message);
+        }
+    };
 
     window.updaterToggleExclude = async function (cb) {
         const id = cb.dataset.pluginId;
@@ -214,17 +751,15 @@
             const data = await resp.json();
             if (data.ok) {
                 excluded = new Set(data.excluded || []);
-                if (shouldExclude) {
+                if (id === CORE_KEY) {
+                    if (coreStatus) coreStatus.excluded = shouldExclude;
+                    updaterRenderCore();
+                } else if (shouldExclude) {
                     delete updates[id];
                     delete updateErrors[id];
                 }
                 updaterRenderUpdates();
-                const pluginCount = Object.keys(updates).length;
-                document.getElementById('updater-status').textContent = pluginCount === 0
-                    ? 'Everything up to date.'
-                    : pluginCount + ' update' + (pluginCount > 1 ? 's' : '') + ' available';
-                document.getElementById('updater-update-all-btn')
-                    .classList.toggle('hidden', pluginCount === 0);
+                updaterRefreshStatusUI();
             } else {
                 cb.checked = !shouldExclude;
                 cb.title = data.error || 'Failed';
@@ -242,6 +777,83 @@
         return updaterDoUpdate(btn.dataset.pluginId, btn);
     };
 
+    // ── Re-check one plugin ────────────────────────────────────────────
+    //
+    // Surfaced as a per-row "Check" button alongside the primary action.
+    // Calls the per-plugin endpoint (cheap: one slot of bulk's parallel
+    // pool, ETag-cached) and merges the result back into the same shared
+    // state the bulk flow uses, then re-renders. Lets the user retry a
+    // single failed row after the cold-pass burnt through the anonymous
+    // GitHub rate-limit window.
+    //
+    // In-flight state is tracked by plugin id (not by DOM element) so
+    // updaterRenderUpdates() can render the new button in its disabled
+    // spinner state. This avoids mutating the original click target after
+    // a re-render has already replaced it.
+    // Per-id deferred error slots. Multiple per-row checks can race,
+    // so a single shared slot would let a late failure clobber an
+    // earlier one before the earlier row got its '!' indicator.
+    const _checkOneErrors = new Map();
+    window.updaterCheckOne = async function (btn) {
+        const id = btn.dataset.pluginId;
+        if (_inflightChecks.has(id)) return;
+        _inflightChecks.add(id);
+        updaterRenderUpdates();
+        try {
+            const resp = await fetch(API + '/check/' + encodeURIComponent(id));
+            const data = await resp.json();
+            if (data.error && !data.plugin_id) {
+                // Validation-level error (bad id, plugin not found).
+                // Surface on the freshly-rendered button after we drop
+                // the in-flight flag below.
+                _checkOneErrors.set(id, data.error);
+                return;
+            }
+            // Pending-restart wins — backend may still report the
+            // pre-update mismatch until its cache turns over and the
+            // marker write lands. Don't let the per-row recheck
+            // revert the "Updated · restart to apply" UI.
+            if (_pendingRestart.has(id)) {
+                delete updates[id];
+                delete updateErrors[id];
+            } else {
+                if (data.update) updates[id] = data.update; else delete updates[id];
+                if (data.error)  updateErrors[id] = data.error; else delete updateErrors[id];
+            }
+            // Replace, don't merge — the backend already returns the full
+            // per-plugin source (Phase 1 fields + _check_one's
+            // source_updates). Merging would leave stale repo/url/branch
+            // fields if a plugin's source can no longer be resolved.
+            if (data.source && Object.keys(data.source).length) {
+                sources[id] = data.source;
+            } else {
+                delete sources[id];
+            }
+            if (data.excluded) excluded.add(id); else excluded.delete(id);
+            if (data.bundled) bundledIds.add(id); else bundledIds.delete(id);
+        } catch (e) {
+            _checkOneErrors.set(id, e.message);
+        } finally {
+            _inflightChecks.delete(id);
+            updaterRenderUpdates();
+            updaterRefreshStatusUI();
+            // Apply any deferred error indicator to the freshly-rendered
+            // button. Done after re-render so we mutate the live element,
+            // not a detached one. Per-id slot means concurrent failing
+            // checks don't clobber each other.
+            if (_checkOneErrors.has(id)) {
+                const message = _checkOneErrors.get(id);
+                _checkOneErrors.delete(id);
+                const row = document.querySelector('[data-row-id="' + CSS.escape(id) + '"]');
+                const newBtn = row ? row.querySelector('button[onclick^="updaterCheckOne("]') : null;
+                if (newBtn) {
+                    newBtn.textContent = '!';
+                    newBtn.title = message;
+                }
+            }
+        }
+    };
+
     async function updaterDoUpdate(id, btn) {
         btn.disabled = true;
         const orig = btn.textContent;
@@ -250,15 +862,17 @@
             const resp = await fetch(API + '/update/' + encodeURIComponent(id), { method: 'POST' });
             const data = await resp.json();
             if (data.ok) {
-                if (data.pending_restart) {
-                    btn.outerHTML = '<span class="text-amber-400 text-xs font-semibold">Restart to apply</span>';
-                    localStorage.setItem(RESTART_KEY, '1');
-                    document.getElementById('updater-restart-banner').classList.remove('hidden');
-                    return true;
-                }
-                btn.outerHTML = '<span class="text-green-400 text-xs font-semibold">Updated</span>';
+                // Both branches need a restart to load the new code,
+                // so clear the row's stale "Update available" state and
+                // mark it pending-restart. Re-render flips Status to
+                // "Updated · restart to apply" immediately.
+                delete updates[id];
+                delete updateErrors[id];
+                markPendingRestart(id);
                 localStorage.setItem(RESTART_KEY, '1');
                 document.getElementById('updater-restart-banner').classList.remove('hidden');
+                updaterRenderUpdates();
+                updaterRefreshStatusUI();
                 return true;
             }
             btn.disabled = false;
@@ -279,10 +893,23 @@
         allBtn.disabled = true;
         allBtn.textContent = 'Updating all...';
 
+        // Core first — if it's behind, applicable, and not blocked.
+        if (coreStatus && coreStatus.behind && !coreStatus.excluded && !coreStatus.rebuild_required) {
+            const coreCard = document.getElementById('updater-core-card');
+            const coreBtn = coreCard ? coreCard.querySelector('button[onclick^="updaterUpdateCore"]') : null;
+            if (coreBtn) await updaterDoCoreUpdate(coreBtn);
+        }
+
         for (const id of Object.keys(updates)) {
             if (excluded.has(id)) continue;
+            // Pending-restart plugins are functionally up-to-date —
+            // the new code is on disk; only the running process is
+            // stale. Skip so Update-all doesn't re-pick them.
+            if (_pendingRestart.has(id)) continue;
             const row = document.querySelector('[data-row-id="' + CSS.escape(id) + '"]');
-            const btn = row ? row.querySelector('button[data-plugin-id]') : null;
+            // Match the Update button specifically — the row may also
+            // hold a "Check" button with data-plugin-id since v1.8.0.
+            const btn = row ? row.querySelector('button[onclick^="updaterUpdate("]') : null;
             if (!btn) continue;
             await updaterDoUpdate(id, btn);
         }
@@ -462,6 +1089,8 @@
         statusEl.textContent = 'Sending restart signal...';
 
         if (isDesktop) {
+            // Flush any staged self-update to disk first, then delegate
+            // the actual process restart to the desktop app.
             try {
                 await fetch(API + '/restart', {
                     method: 'POST',
@@ -491,6 +1120,7 @@
 
         if (back) {
             localStorage.removeItem(RESTART_KEY);
+            clearPendingRestart();
             document.getElementById('updater-restart-banner').classList.add('hidden');
             const elapsed = Math.round((Date.now() - start) / 100) / 10;
             const s = document.getElementById('updater-status');
@@ -511,6 +1141,8 @@
     window.updaterDismissBanner = function () {
         document.getElementById('updater-restart-banner').classList.add('hidden');
         localStorage.removeItem(RESTART_KEY);
+        clearPendingRestart();
+        updaterRenderUpdates();
     };
 
     // ── Utility ────────────────────────────────────────────────────────
